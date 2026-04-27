@@ -11,7 +11,7 @@ def main():
     selected_assemblies = pd.read_csv(os.path.join(DATA_DIR, "selected_assemblies.tsv"), sep="\t")
 
     # Collect all unique entity names from the entity_pair column and the corresponding cluster ID
-    entity_names = set()
+    entity_names = list()
     cluster_ids = list()
     sequences = list()
     missing_sequences = list()
@@ -23,7 +23,7 @@ def main():
             if entity.strip() in entity_names:
                 continue
             
-            entity_names.add(entity.strip())
+            entity_names.append(entity.strip())
 
             # cluster
             cluster_pair = row["cluster_pair_100pct"]
