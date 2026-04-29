@@ -51,6 +51,8 @@ class Candidate:
     cluster_pair: Tuple[str, str]
     entity_pair: Tuple[str, str]
     uniprot_pair: Tuple[str, str]
+    species_pair: Tuple[str, str]
+    taxonomy_pair: Tuple[str, str]
     dimer_type: str
     resolution: float
     modeled_residue_count: int
@@ -187,6 +189,10 @@ query AssemblyBatch($assembly_ids: [String!]!) {
         rcsb_id
         entity_poly {
           rcsb_entity_polymer_type
+        }
+        rcsb_entity_source_organism {
+            ncbi_taxonomy_id
+            ncbi_scientific_name
         }
         rcsb_polymer_entity_container_identifiers {
           entity_id
@@ -328,6 +334,29 @@ def uniprot_ids_for_entity(polymer_entity: Dict[str, Any]) -> str:
 
     return ";".join(sorted(uniprot_ids))
 
+def species_for_entity(polymer_entity: Dict[str, Any]) -> Tuple[str, str]:
+    """Return source organism scientific name(s) and NCBI taxonomy ID(s)."""
+    names = set()
+    tax_ids = set()
+
+    for org in polymer_entity.get("rcsb_entity_source_organism") or []:
+        if not isinstance(org, dict):
+            continue
+
+        name = org.get("ncbi_scientific_name")
+        tax_id = org.get("ncbi_taxonomy_id")
+
+        if isinstance(name, list):
+            names.update(str(x) for x in name if x)
+        elif name:
+            names.add(str(name))
+
+        if isinstance(tax_id, list):
+            tax_ids.update(str(x) for x in tax_id if x)
+        elif tax_id:
+            tax_ids.add(str(tax_id))
+
+    return ";".join(sorted(names)), ";".join(sorted(tax_ids))
 
 def build_asym_to_entity(assembly: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
     mapping: Dict[str, Dict[str, Any]] = {}
@@ -376,6 +405,9 @@ def candidate_from_assembly(assembly: Dict[str, Any]) -> Optional[Candidate]:
             print(f"Skipping {assembly_id}: missing protein-entity or cluster information", file=sys.stderr)
             return None
         uniprot_id = uniprot_ids_for_entity(entities[0])
+        species, taxonomy = species_for_entity(entities[0])
+        species_pair = (species, species)
+        taxonomy_pair = (taxonomy, taxonomy)
         dimer_type = "homo"
         entity_pair = (entity_id, entity_id)
         cluster_pair = (str(cluster_id), str(cluster_id))
@@ -389,12 +421,15 @@ def candidate_from_assembly(assembly: Dict[str, Any]) -> Optional[Candidate]:
                 print(f"Skipping {assembly_id}: missing protein-entity or cluster information", file=sys.stderr)
                 return None
             uniprot_id = uniprot_ids_for_entity(pe)
-            entity_records.append((entity_id, str(cluster_id), uniprot_id))
+            species, taxonomy = species_for_entity(pe)
+            entity_records.append((entity_id, str(cluster_id), uniprot_id, species, taxonomy))
         entity_records.sort(key=lambda item: item[0])
         dimer_type = "hetero"
         entity_pair = (entity_records[0][0], entity_records[1][0])
         cluster_pair = tuple(sorted((entity_records[0][1], entity_records[1][1])))
         uniprot_pair = (entity_records[0][2], entity_records[1][2])
+        species_pair = (entity_records[0][3], entity_records[1][3])
+        taxonomy_pair = (entity_records[0][4], entity_records[1][4])
     else:
         print(
             f"Skipping {assembly_id}: expected 1 or 2 unique protein entities in a protein dimer assembly, got {len(entities)}",
@@ -416,6 +451,8 @@ def candidate_from_assembly(assembly: Dict[str, Any]) -> Optional[Candidate]:
         cluster_pair=(str(cluster_pair[0]), str(cluster_pair[1])),
         entity_pair=(str(entity_pair[0]), str(entity_pair[1])),
         uniprot_pair=(str(uniprot_pair[0]), str(uniprot_pair[1])),
+        species_pair=(str(species_pair[0]), str(species_pair[1])),
+        taxonomy_pair=(str(taxonomy_pair[0]), str(taxonomy_pair[1])),
         dimer_type=dimer_type,
         resolution=resolution,
         modeled_residue_count=modeled,
@@ -438,6 +475,12 @@ def write_tsv(path: Path, rows: Sequence[Candidate]) -> None:
             "uniprot_pair",
             "uniprot_1",
             "uniprot_2",
+            "species_pair",
+            "species_1",
+            "species_2",
+            "taxonomy_pair",
+            "taxonomy_1",
+            "taxonomy_2",
             "dimer_type",
             "cluster_pair_100pct",
             "resolution_best_angstrom",
@@ -456,6 +499,12 @@ def write_tsv(path: Path, rows: Sequence[Candidate]) -> None:
                 "|".join(c.uniprot_pair),
                 c.uniprot_pair[0],
                 c.uniprot_pair[1],
+                "|".join(c.species_pair),
+                c.species_pair[0],
+                c.species_pair[1],
+                "|".join(c.taxonomy_pair),
+                c.taxonomy_pair[0],
+                c.taxonomy_pair[1],
                 c.dimer_type,
                 ",".join(c.cluster_pair),
                 "" if math.isinf(c.resolution) else c.resolution,
