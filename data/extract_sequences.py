@@ -16,6 +16,7 @@ def main():
     cluster_ids = list()
     sequences = list()
     missing_sequences = list()
+    binary_masks = list()
     for _, row in selected_assemblies.iterrows():
         # entity
         entity_pair = row["entity_pair"]
@@ -63,9 +64,17 @@ def main():
                     print(f"Debug: Remapping details: {remapping}", file=sys.stderr)
                     entity_number = remapping_row[0] # Update entity number based on remapping
                     break
+            
+            # asym_id mapping
+            asym_ids = list()
+            table = block.find("_struct_asym.", ["id", "entity_id"])
+            for asym_row in table:
+                if entity_number == asym_row[1]:
+                    asym_ids.append(asym_row[0])
 
             # extract sequence information
             size_before = len(sequences)
+            seq_length = 0
             for st_entity in st.entities:
                 if st_entity.name == entity_number:
                     seq_3letter = st_entity.full_sequence
@@ -78,19 +87,55 @@ def main():
                         print(f"Debug: 3-letter sequence: {seq_3letter}", file=sys.stderr)
 
                     seq_1letter = gemmi.one_letter_code(seq_3letter)
+                    seq_length = len(seq_1letter)
                     sequences.append(seq_1letter)
-                    print(f"Entity: {entity}, Cluster ID: {cluster_ids[-1]}, Sequence: {seq_1letter}")
 
             if len(sequences) == size_before:
                 print(f"Warning: No sequence found for entity {entity} in file {CIF_PATH}", file=sys.stderr)
                 sequences.append("-") # Placeholder for missing sequence
                 missing_sequences.append(entity)
+            
+            # Structure annotation mask per residue
+            asym_id_to_residues_mask = {asym_id: [] for asym_id in asym_ids}
+            for atom_row in block.find(
+                "_atom_site.",
+                [
+                    "label_asym_id",
+                    "label_seq_id",
+                ],
+            ):
+                asym_id, seq_id = atom_row
+
+                if asym_id in asym_ids:
+                    if int(seq_id)-1 in asym_id_to_residues_mask[asym_id]:
+                        continue  # Skip duplicate residue entries
+                    else:
+                        asym_id_to_residues_mask[asym_id].append(int(seq_id)-1)  # Store the index of present residues
+        
+            # convert number lists to binary masks
+            for asym_id in asym_id_to_residues_mask:
+                mask = [0] * seq_length  # Initialize mask with all residues marked as missing
+                for index in asym_id_to_residues_mask[asym_id]:
+                    if index < seq_length:
+                        mask[index] = 1  # Mark present residues as True
+                    else:
+                        print(f"Warning: Residue index {index} exceeds sequence length {seq_length} for entity {entity} in file {CIF_PATH}. Asym_id: {asym_id}", file=sys.stderr)
+                asym_id_to_residues_mask[asym_id] = mask
+            
+            # convert dict to list of masks (one per sequence)
+            entry = ""
+            for asym_id in asym_ids:
+                entry += f"{asym_id}: {"".join(map(str, asym_id_to_residues_mask[asym_id]))}; "
+            binary_masks.append(entry.strip())
+
+
     
     # print different lengths
     print(f"Number of unique entities: {len(entity_names)}")
     print(f"Number of cluster IDs: {len(cluster_ids)}")
     print(f"Number of sequences: {len(sequences)}")
     print(f"Number of missing sequences: {len(missing_sequences)}")
+    print(f"Number of binary masks: {len(binary_masks)}")
     if missing_sequences:
         print("Missing sequences for entities:", missing_sequences, file=sys.stderr)
 
@@ -98,7 +143,8 @@ def main():
     df = pd.DataFrame({
         "entity_name": list(entity_names),
         "cluster_id": cluster_ids,
-        "sequence": sequences
+        "sequence": sequences,
+        "binary_mask": binary_masks
     })
 
     # Save the DataFrame to a TSV file
