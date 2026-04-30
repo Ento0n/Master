@@ -1,0 +1,1 @@
+cd-hit -i /nfs/scratch/pdb_dimers/output.fasta -o /nfs/home/students/a.spannagl/master_repository/data/cd_hit/result/output

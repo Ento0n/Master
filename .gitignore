@@ -2,3 +2,4 @@
 **/slurm/*
 server_handling.txt
 .vscode/
+./data/cd_hit/result/*
