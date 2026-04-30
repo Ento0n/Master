@@ -1,3 +1,4 @@
 **/logs/*
 **/slurm/*
 server_handling.txt
+.vscode/
