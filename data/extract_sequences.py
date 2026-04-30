@@ -1,5 +1,6 @@
 import sys
 import os
+from datetime import datetime
 
 from numpy import block
 import pandas as pd
@@ -8,6 +9,9 @@ import gemmi
 DATA_DIR = "/nfs/scratch/pdb_dimers/"
 
 def main():
+    # print timestamp
+    print(f"Starting sequence extraction at {datetime.now().isoformat(timespec='seconds')}")
+
     # Load the selected assemblies
     selected_assemblies = pd.read_csv(os.path.join(DATA_DIR, "selected_assemblies.tsv"), sep="\t")
 
@@ -149,6 +153,9 @@ def main():
 
     # Save the DataFrame to a TSV file
     df.to_csv(os.path.join(DATA_DIR, "entity_sequences.tsv"), sep="\t", index=False)
+
+    print(f"Sequence extraction completed. Output saved to {os.path.join(DATA_DIR, 'entity_sequences.tsv')}")
+    print(f"Finished sequence extraction at {datetime.now().isoformat(timespec='seconds')}")
                         
 
 

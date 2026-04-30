@@ -34,6 +34,7 @@ import sys
 import time
 import urllib.error
 import urllib.request
+from datetime import datetime
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
@@ -526,6 +527,9 @@ def select_representatives(candidates: Sequence[Candidate]) -> List[Candidate]:
 
 
 def main() -> int:
+    # print timestamp
+    print(f"Starting RCSB protein dimer download at {datetime.now().isoformat(timespec='seconds')}")
+
     parser = argparse.ArgumentParser(description="Download non-redundant RCSB protein-only biological-assembly dimers.")
     parser.add_argument("--outdir", default="rcsb_protein_dimers", help="Output directory [default: %(default)s]")
     parser.add_argument("--batch-size", type=int, default=200, help="GraphQL metadata batch size [default: %(default)s]")
@@ -575,6 +579,7 @@ def main() -> int:
             download_binary(c.download_url, dest)
 
     print(f"Done. Representatives: {outdir / 'selected_assemblies.tsv'}", file=sys.stderr)
+    print(f"Finished RCSB protein dimer download at {datetime.now().isoformat(timespec='seconds')}", file=sys.stderr)
     return 0
 
 
