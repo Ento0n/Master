@@ -427,7 +427,7 @@ def candidate_from_assembly(assembly: Dict[str, Any]) -> Optional[Candidate]:
         entity_records.sort(key=lambda item: item[0])
         dimer_type = "hetero"
         entity_pair = (entity_records[0][0], entity_records[1][0])
-        cluster_pair = tuple(sorted((entity_records[0][1], entity_records[1][1])))
+        cluster_pair = (entity_records[0][1], entity_records[1][1])
         uniprot_pair = (entity_records[0][2], entity_records[1][2])
         species_pair = (entity_records[0][3], entity_records[1][3])
         taxonomy_pair = (entity_records[0][4], entity_records[1][4])
