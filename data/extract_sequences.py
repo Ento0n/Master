@@ -13,7 +13,7 @@ def main():
     print(f"Starting sequence extraction at {datetime.now().isoformat(timespec='seconds')}")
 
     # Load the selected assemblies
-    selected_assemblies = pd.read_csv(os.path.join(DATA_DIR, "selected_assemblies.tsv"), sep="\t")
+    selected_assemblies = pd.read_csv(os.path.join(DATA_DIR, "all_candidate_assemblies.tsv"), sep="\t")
 
     # Collect all unique entity names from the entity_pair column and the corresponding cluster ID
     entity_names = list()

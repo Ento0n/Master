@@ -7,7 +7,7 @@ DATA_DIR = "/nfs/scratch/pdb_dimers/"
 
 def main():
     # load dataframes
-    interaction_df = pd.read_csv(os.path.join(DATA_DIR, "selected_assemblies.tsv"), sep="\t")
+    interaction_df = pd.read_csv(os.path.join(DATA_DIR, "all_candidate_assemblies.tsv"), sep="\t")
     seqs_df = pd.read_csv(os.path.join(DATA_DIR, "entity_sequences.tsv"), sep="\t")
 
     # filter interactions by sequence length

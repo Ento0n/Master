@@ -11,10 +11,12 @@ def main():
     seqs_df = pd.read_csv(os.path.join(DATA_DIR, "entity_sequences.tsv"), sep="\t")
     int_df = pd.read_csv(os.path.join(DATA_DIR, "filtered_interactions.tsv"), sep="\t")
 
-    # Apply the filtering criteria to the seqs_df to keep only sequences that are between 50 and 1250 residues long and have less than 15% unknown residues
-    seqs_df["length"] = seqs_df["sequence"].apply(len)
-    seqs_df = seqs_df[(seqs_df["length"] >= 50) & (seqs_df["length"] <= 1250)]
-    seqs_df = seqs_df[seqs_df["sequence"].apply(lambda seq: seq.count("X") / len(seq) * 100 < 15)]
+    # Only keep rows in seqs_df that are present in int_df
+    valid_entity_names = set()
+    for _, row in int_df.iterrows():
+        entity_pair = row["entity_pair"].split(",")
+        valid_entity_names.update([entity.strip() for entity in entity_pair])
+    seqs_df = seqs_df[seqs_df["entity_name"].isin(valid_entity_names)]
 
     # Group by unique Sequence and aggregate entity names, cluster IDs
     sequence2clusterids_df = (
@@ -26,10 +28,18 @@ def main():
             .reset_index()
     )
 
-    # Is there any cluster with more than one unique sequence? If so, print a Warning and the corresponding cluster ID, entity names, and sequences
+    # Is there any cluster with more than one unique sequence? If so, save the connected PDB IDs, print a Warning and the corresponding cluster ID, entity names, and sequences
+    falsy_pdb_ids = []
     for i, row in sequence2clusterids_df.iterrows():
         if len(row["cluster_id"]) > 1:
+            falsy_pdb_ids.extend([entity.split("_")[0] for entity in row["entity_name"]])
             print(f"Warning: Row {i} has more than one unique cluster ID. Entity names: {row['entity_name']}, Cluster IDs: {row['cluster_id']}, Sequence: {row['sequence']}", file=sys.stderr)
+    
+    # Remove rows with falsy cluster assignments from the interaction dataframe
+    print(f"Removing interactions involving PDB IDs: {set(falsy_pdb_ids)}")
+    print(f"Number of interactions before filtering: {len(int_df)}")
+    int_df = int_df[~int_df["pdb_id"].isin(falsy_pdb_ids)]
+    print(f"Number of interactions after filtering: {len(int_df)}")
 
     # Give each row a new cluster ID based on the sequence, e.g. "fix_1_100", "fix_2_100", etc.
     sequence2clusterids_df["new_cluster_id"] = sequence2clusterids_df.index.map(lambda x: f"fix_{x+1}_100")
@@ -61,7 +71,7 @@ def main():
 
     # Save the new interaction dataframe and the new sequence-to-cluster mapping with the new cluster pairs to a new TSV file
     int_df.to_csv(os.path.join(DATA_DIR, "filtered_interactions_with_clusters.tsv"), sep="\t", index=False)
-    sequence2clusterids_df.to_csv(os.path.join(DATA_DIR, "entity_sequence_with_new_clusters.tsv"), sep="\t", index=False)
+    sequence2clusterids_df.to_csv(os.path.join(DATA_DIR, "unique_sequences.tsv"), sep="\t", index=False)
 
 if __name__ == "__main__":
     main()

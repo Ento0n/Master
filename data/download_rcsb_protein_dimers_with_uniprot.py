@@ -559,23 +559,23 @@ def main() -> int:
         if c is not None:
             candidates.append(c)
     candidates = sorted(candidates, key=lambda c: (c.pdb_id, c.assembly_number))
-    reps = select_representatives(candidates)
+    # reps = select_representatives(candidates)
  
     # Write TSV files for all candidates and selected representatives
     write_tsv(outdir / "all_candidate_assemblies.tsv", candidates)
-    write_tsv(outdir / "selected_assemblies.tsv", reps)
+    # write_tsv(outdir / "selected_assemblies.tsv", reps)
 
     print(f"Parsed {len(candidates)} candidate assemblies", file=sys.stderr)
-    print(f"Selected {len(reps)} non-redundant representatives at 100% sequence-pair identity", file=sys.stderr)
+    # print(f"Selected {len(reps)} non-redundant representatives at 100% sequence-pair identity", file=sys.stderr)
 
     # Download coordinate files for representatives, skipping existing files
     if not args.no_download:
-        for i, c in enumerate(reps, start=1):
+        for i, c in enumerate(candidates, start=1):
             dest = assembly_dir / c.local_filename
             if dest.exists() and dest.stat().st_size > 0:
-                print(f"[{i}/{len(reps)}] exists {dest}", file=sys.stderr)
+                print(f"[{i}/{len(candidates)}] exists {dest}", file=sys.stderr)
                 continue
-            print(f"[{i}/{len(reps)}] downloading {c.assembly_id}", file=sys.stderr)
+            print(f"[{i}/{len(candidates)}] downloading {c.assembly_id}", file=sys.stderr)
             download_binary(c.download_url, dest)
 
     print(f"Done. Representatives: {outdir / 'selected_assemblies.tsv'}", file=sys.stderr)
