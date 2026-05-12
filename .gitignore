@@ -4,3 +4,4 @@ server_handling.txt
 .vscode/
 ./data/cd_hit/result/*
 .codex
+**/__pycache__/*
