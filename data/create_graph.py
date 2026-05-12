@@ -1,16 +1,13 @@
 import os
-import sys
 from datetime import datetime
 from typing import Dict
 
 import pandas as pd
+import networkx as nx
 
 DATA_DIR = "/nfs/scratch/pdb_dimers/"
 
-def main():
-    # print timestamp
-    print(f"Starting graph creation at {datetime.now().isoformat(timespec='seconds')}")
-
+def create_metis_graph():
     # Load interacion dataframe
     interaction_df = pd.read_csv(os.path.join(DATA_DIR, "final_filtered_interactions.tsv"), sep="\t")
 
@@ -56,12 +53,43 @@ def main():
             for neighbor in neighbors:
                 f.write(f"{neighbor} ")
             f.write("\n")
-
-
-
-
     
+    print(f"METIS graph saved to: {os.path.join(DATA_DIR, 'KaHIP', 'cluster.graph')}")
 
+def create_nx_graph_from_metis():
+    G = nx.Graph()
+
+    with open(os.path.join(DATA_DIR, "KaHIP", "cluster.graph"), "r") as f:
+        lines = [line.strip() for line in f if line.strip() and not line.startswith("%")]
+
+    header = lines[0].split()
+    n_nodes = int(header[0])
+
+    for i in range(1, n_nodes + 1):
+        G.add_node(i)
+
+    for i, line in enumerate(lines[1:], start=1):
+        neighbors = list(map(int, line.split()))
+
+        for j in neighbors:
+            # METIS uses 1-based node IDs
+            if i < j:  # avoid adding undirected edges twice
+                G.add_edge(i, j)
+
+    nx.write_gexf(G, os.path.join(DATA_DIR, "KaHIP", "cluster.graph.gexf"))
+    print(f"NetworkX graph saved to: {os.path.join(DATA_DIR, 'KaHIP', 'cluster.graph.gexf')}")
+
+def main():
+    # print timestamp
+    print(f"Starting graph creation at {datetime.now().isoformat(timespec='seconds')}")
+
+    create_metis_graph()
+
+    print(f"Graph creation completed at {datetime.now().isoformat(timespec='seconds')}")
+
+    create_nx_graph_from_metis()
+
+    print(f"NetworkX graph created from METIS file at {datetime.now().isoformat(timespec='seconds')}")
 
 if __name__ == "__main__":
     main()
