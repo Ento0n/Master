@@ -31,7 +31,7 @@ from pathlib import Path
 import pandas as pd
 
 
-DEFAULT_INPUT = Path("/nfs/scratch/pdb_dimers/final_filtered_interactions_with_partitions.tsv")
+DEFAULT_INPUT = Path("/nfs/scratch/pdb_dimers/final_final_filtered_interactions_with_partitions.tsv")
 DEFAULT_OUTPUT = Path("/nfs/scratch/pdb_dimers/balanced_positive_negative_interactions.tsv")
 
 
@@ -59,6 +59,21 @@ def most_common_value(values: pd.Series) -> str:
     return Counter(clean_values).most_common(1)[0][0]
 
 
+def split_pair_values(values: pd.Series, column_name: str) -> tuple[pd.Series, pd.Series]:
+    """Split a comma-separated pair column into two stripped endpoint columns."""
+    split_values = values.astype(str).str.split(",", n=1, expand=True)
+    if split_values.shape[1] == 1:
+        split_values[1] = ""
+
+    endpoint_a = split_values[0].fillna("").str.strip()
+    endpoint_b = split_values[1].fillna("").str.strip()
+    if (endpoint_a == "").any() or (endpoint_b == "").any():
+        bad_rows = values.index[(endpoint_a == "") | (endpoint_b == "")].tolist()[:5]
+        raise ValueError(f"{column_name} must contain two comma-separated values; bad rows: {bad_rows}")
+
+    return endpoint_a, endpoint_b
+
+
 def add_helper_columns(df: pd.DataFrame, reset_order: bool = False) -> pd.DataFrame:
     """Add the columns used for balancing without changing the original columns."""
     df = df.copy()
@@ -71,6 +86,10 @@ def add_helper_columns(df: pd.DataFrame, reset_order: bool = False) -> pd.DataFr
     if df.empty:
         df["_cluster_a"] = pd.Series(dtype=str)
         df["_cluster_b"] = pd.Series(dtype=str)
+        df["_entity_a"] = pd.Series(dtype=str)
+        df["_entity_b"] = pd.Series(dtype=str)
+        df["_cluster_100pct_a"] = pd.Series(dtype=str)
+        df["_cluster_100pct_b"] = pd.Series(dtype=str)
         df["_pair_key"] = pd.Series(dtype=object)
         df["_species_key_a"] = pd.Series(dtype=str)
         df["_species_key_b"] = pd.Series(dtype=str)
@@ -78,16 +97,12 @@ def add_helper_columns(df: pd.DataFrame, reset_order: bool = False) -> pd.DataFr
         df["_species_relation"] = pd.Series(dtype=str)
         return df
 
-    split_clusters = df["new_cluster_pair"].astype(str).str.split(",", n=1, expand=True)
-    if split_clusters.shape[1] == 1:
-        split_clusters[1] = ""
-
-    df["_cluster_a"] = split_clusters[0].fillna("").str.strip()
-    df["_cluster_b"] = split_clusters[1].fillna("").str.strip()
-    if (df["_cluster_a"] == "").any() or (df["_cluster_b"] == "").any():
-        bad_rows = df.index[(df["_cluster_a"] == "") | (df["_cluster_b"] == "")].tolist()[:5]
-        raise ValueError(f"new_cluster_pair must contain two comma-separated clusters; bad rows: {bad_rows}")
-
+    df["_cluster_a"], df["_cluster_b"] = split_pair_values(df["new_cluster_pair"], "new_cluster_pair")
+    df["_entity_a"], df["_entity_b"] = split_pair_values(df["entity_pair"], "entity_pair")
+    df["_cluster_100pct_a"], df["_cluster_100pct_b"] = split_pair_values(
+        df["cluster_pair_100pct"],
+        "cluster_pair_100pct",
+    )
     df["_pair_key"] = [canonical_pair(a, b) for a, b in zip(df["_cluster_a"], df["_cluster_b"])]
     df["_species_key_a"] = [species_key(t, s) for t, s in zip(df["taxonomy_1"], df["species_1"])]
     df["_species_key_b"] = [species_key(t, s) for t, s in zip(df["taxonomy_2"], df["species_2"])]
@@ -113,6 +128,8 @@ def load_and_prepare_interactions(input_file: Path) -> tuple[pd.DataFrame, list[
         df = df.rename(columns=renamed_columns)
 
     required_columns = {
+        "entity_pair",
+        "cluster_pair_100pct",
         "new_cluster_pair",
         "species_1",
         "species_2",
@@ -274,9 +291,30 @@ def build_negative_dataframe(
         sampled_pairs
     ):
         row = {column: "" for column in original_columns}
+        metadata_a = metadata.get(cluster_a, {})
+        metadata_b = metadata.get(cluster_b, {})
 
-        partition_a = metadata.get(cluster_a, {}).get("partition", "")
-        partition_b = metadata.get(cluster_b, {}).get("partition", "")
+        entity_a = metadata_a.get("entity", "")
+        entity_b = metadata_b.get("entity", "")
+        if not entity_a or not entity_b:
+            raise ValueError(
+                "Could not find representative entity names for sampled negative pair "
+                f"{cluster_a},{cluster_b}"
+            )
+
+        cluster_100pct_a = metadata_a.get("cluster_100pct", "")
+        cluster_100pct_b = metadata_b.get("cluster_100pct", "")
+        if not cluster_100pct_a or not cluster_100pct_b:
+            raise ValueError(
+                "Could not find representative 100%-cluster ids for sampled negative pair "
+                f"{cluster_a},{cluster_b}"
+            )
+
+        uniprot_a = metadata_a.get("uniprot", "")
+        uniprot_b = metadata_b.get("uniprot", "")
+
+        partition_a = metadata_a.get("partition", "")
+        partition_b = metadata_b.get("partition", "")
         if partition_a and partition_a == partition_b:
             partition = partition_a
         elif partition_a or partition_b:
@@ -287,6 +325,13 @@ def build_negative_dataframe(
         row.update(
             {
                 "assembly_id": f"negative_{safe_split}_{dimer_type}_{row_number}",
+                "entity_pair": f"{entity_a},{entity_b}",
+                "uniprot_pair": f"{uniprot_a}|{uniprot_b}" if uniprot_a or uniprot_b else "",
+                "uniprot_1": uniprot_a,
+                "uniprot_2": uniprot_b,
+                "species_pair": f"{species_a}|{species_b}",
+                "taxonomy_pair": f"{taxonomy_a}|{taxonomy_b}",
+                "cluster_pair_100pct": f"{cluster_100pct_a},{cluster_100pct_b}",
                 "new_cluster_pair": f"{cluster_a},{cluster_b}",
                 "dimer_type": dimer_type,
                 "species_1": species_a,
@@ -346,15 +391,37 @@ def process_split(
     print(f"Split: {split_value}")
 
     # Build one metadata table per sequence in this split.  Negative rows reuse
-    # this metadata so sampled pairs still carry species, taxonomy, and partition.
-    endpoint_a = split_df[["_cluster_a", "taxonomy_1", "species_1", "split", "partitions"]].rename(
-        columns={"_cluster_a": "cluster", "taxonomy_1": "taxonomy", "species_1": "species"}
+    # this metadata so sampled pairs still carry source entity, species,
+    # taxonomy, and partition annotations.
+    endpoint_a = split_df[
+        ["_cluster_a", "_entity_a", "_cluster_100pct_a", "taxonomy_1", "species_1", "split", "partitions"]
+    ].rename(
+        columns={
+            "_cluster_a": "cluster",
+            "_entity_a": "entity",
+            "_cluster_100pct_a": "cluster_100pct",
+            "taxonomy_1": "taxonomy",
+            "species_1": "species",
+        }
     )
-    endpoint_b = split_df[["_cluster_b", "taxonomy_2", "species_2", "split", "partitions"]].rename(
-        columns={"_cluster_b": "cluster", "taxonomy_2": "taxonomy", "species_2": "species"}
+    endpoint_b = split_df[
+        ["_cluster_b", "_entity_b", "_cluster_100pct_b", "taxonomy_2", "species_2", "split", "partitions"]
+    ].rename(
+        columns={
+            "_cluster_b": "cluster",
+            "_entity_b": "entity",
+            "_cluster_100pct_b": "cluster_100pct",
+            "taxonomy_2": "taxonomy",
+            "species_2": "species",
+        }
     )
+    endpoint_a["uniprot"] = split_df["uniprot_1"] if "uniprot_1" in split_df.columns else ""
+    endpoint_b["uniprot"] = split_df["uniprot_2"] if "uniprot_2" in split_df.columns else ""
     endpoints = pd.concat([endpoint_a, endpoint_b], ignore_index=True)
     metadata_df = endpoints.groupby("cluster", sort=False).agg(
+        entity=("entity", most_common_value),
+        cluster_100pct=("cluster_100pct", most_common_value),
+        uniprot=("uniprot", most_common_value),
         taxonomy=("taxonomy", most_common_value),
         species=("species", most_common_value),
         split=("split", most_common_value),
@@ -368,6 +435,13 @@ def process_split(
     multi_taxonomy_clusters = int((taxonomy_per_cluster.map(len) > 1).sum())
     if multi_taxonomy_clusters:
         print(f"  note: {multi_taxonomy_clusters} clusters have multiple taxonomy annotations; using most common value")
+
+    entities_per_cluster = endpoints.groupby("cluster")["entity"].agg(
+        lambda values: {str(value).strip() for value in values if str(value).strip()}
+    )
+    multi_entity_clusters = int((entities_per_cluster.map(len) > 1).sum())
+    if multi_entity_clusters:
+        print(f"  note: {multi_entity_clusters} clusters have multiple entity annotations; using most common value")
 
     empty_negatives = pd.DataFrame(columns=original_columns)
     empty_negatives = add_helper_columns(empty_negatives, reset_order=True)
