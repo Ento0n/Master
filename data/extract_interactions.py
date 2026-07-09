@@ -1,7 +1,7 @@
 import pandas as pd
 
 def main():
-    interactions = pd.read_csv("/nfs/scratch/pdb_dimers/final_final_filtered_interactions_with_partitions.tsv", sep="\t")
+    interactions = pd.read_csv("/nfs/scratch/pdb_dimers/final_filtered_interactions.tsv", sep="\t")
 
     output = interactions[["uniprot_1", "uniprot_2"]].copy()
 
@@ -11,6 +11,8 @@ def main():
     output.rename(columns={"uniprot_1":"protein1", "uniprot_2":"protein2"}, inplace=True)
 
     output.dropna(subset=["protein1", "protein2"], inplace=True)
+
+    output.drop_duplicates(inplace=True)
 
     output.to_csv("/nfs/scratch/pdb_dimers/pinder/pdb_interactions.tsv", sep="\t", index=None)
 
