@@ -224,9 +224,17 @@ class DScriptInteractionModel(nn.Module):
         embeddings_2: torch.Tensor,
         mask_1: torch.Tensor | None = None,
         mask_2: torch.Tensor | None = None,
+        interaction_pair_mask: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Return ``(contact_map, interaction_probability)``."""
-        logits, contacts = self.forward(embeddings_1, embeddings_2, mask_1, mask_2, return_contact_map=True)
+        logits, contacts = self.forward(
+            embeddings_1,
+            embeddings_2,
+            mask_1,
+            mask_2,
+            interaction_pair_mask=interaction_pair_mask,
+            return_contact_map=True,
+        )
         return contacts, torch.sigmoid(logits)
 
     def predict_probability(
@@ -235,9 +243,18 @@ class DScriptInteractionModel(nn.Module):
         embeddings_2: torch.Tensor,
         mask_1: torch.Tensor | None = None,
         mask_2: torch.Tensor | None = None,
+        interaction_pair_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Return interaction probabilities in [0, 1]."""
-        return torch.sigmoid(self.forward(embeddings_1, embeddings_2, mask_1, mask_2))
+        return torch.sigmoid(
+            self.forward(
+                embeddings_1,
+                embeddings_2,
+                mask_1,
+                mask_2,
+                interaction_pair_mask=interaction_pair_mask,
+            )
+        )
 
     def forward(
         self,
@@ -247,6 +264,7 @@ class DScriptInteractionModel(nn.Module):
         mask_2: torch.Tensor | None = None,
         return_contact_map: bool = False,
         return_contact_logits: bool = False,
+        interaction_pair_mask: torch.Tensor | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor] | tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Return interaction logits, optionally with contact probabilities/logits."""
         # Contact logits are needed for BCEWithLogits contact-map supervision.
@@ -257,8 +275,11 @@ class DScriptInteractionModel(nn.Module):
         pair_mask = self._pair_mask(contacts, mask_1, mask_2)
         contacts = contacts.masked_fill(~pair_mask, 0.0)
 
-        # Pool the full contact map into one scalar logit per protein pair.
-        logits = self._interaction_logits(contacts, pair_mask)
+        # Pool only residue pairs allowed for interaction prediction. The base
+        # pair_mask removes batch padding; interaction_pair_mask can further
+        # remove unresolved/unknown structure cells from true contact maps.
+        pooling_mask = self._pooling_pair_mask(pair_mask, interaction_pair_mask)
+        logits = self._interaction_logits(contacts, pooling_mask)
 
         if return_contact_map and return_contact_logits:
             return logits, contacts, contact_logits
@@ -363,3 +384,21 @@ class DScriptInteractionModel(nn.Module):
         # valid only if both the residue from protein 1 and the residue from
         # protein 2 are real, non-padding residues.
         return mask_1[:, :, None] & mask_2[:, None, :]
+
+    @staticmethod
+    def _pooling_pair_mask(
+        pair_mask: torch.Tensor,
+        interaction_pair_mask: torch.Tensor | None,
+    ) -> torch.Tensor:
+        """Return the residue-pair mask used for interaction-score pooling."""
+        if interaction_pair_mask is None:
+            return pair_mask
+
+        # interaction_pair_mask has the same [batch, residues_1, residues_2]
+        # layout as the contact map. True means the residue pair is allowed to
+        # influence the interaction score. False removes padding or unresolved
+        # structure cells such as contact-map targets encoded as -1.
+        interaction_pair_mask = interaction_pair_mask.to(device=pair_mask.device, dtype=torch.bool)
+        if interaction_pair_mask.shape != pair_mask.shape:
+            raise ValueError("interaction_pair_mask must be shaped [batch, residues_1, residues_2]")
+        return pair_mask & interaction_pair_mask

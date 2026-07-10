@@ -19,6 +19,7 @@ from torch.utils.data import DataLoader, Dataset
 
 import lightning.pytorch as pl
 from lightning.pytorch.callbacks import ModelCheckpoint
+from lightning.pytorch.loggers import CSVLogger
 
 from models import DScriptInteractionModel, FullyConnectedInteractionModel
 
@@ -35,6 +36,7 @@ ONE_HOT_DEPTH = len(AMINO_ACIDS) + 1
 # Dimer types are kept as small integer tensors so test-time metrics can be
 # split by homodimer/heterodimer without passing strings through the DataLoader.
 DIMER_TYPE_TO_INDEX = {"homo": 0, "hetero": 1}
+INTERACTION_THRESHOLD = 0.5
 
 # These defaults point at the current prepared dimer dataset. They can all be
 # overridden from the command line, which is useful for small debug subsets or
@@ -43,6 +45,7 @@ DEFAULT_STRICT_FILE = Path("/nfs/scratch/pdb_dimers/balanced_interactions_strict
 DEFAULT_SEQUENCE_FILE = Path("/nfs/scratch/pdb_dimers/entity_sequences.tsv")
 DEFAULT_EMBEDDING_MANIFEST = Path("/nfs/scratch/pdb_dimers/embeddings/esm2_t33_650M/manifest.tsv")
 DEFAULT_CONTACT_MAP_DIR = Path("/nfs/scratch/pdb_dimers/contact_maps")
+CONTACT_MAP_SAMPLE_COUNT = 5
 
 
 def parse_args() -> argparse.Namespace:
@@ -234,6 +237,75 @@ def print_split_summary(
     )
 
 
+def save_loss_plot(metrics_path: Path, output_path: Path) -> None:
+    """Plot epoch-level train/validation losses from Lightning's CSV metrics."""
+    if not metrics_path.exists():
+        print(f"Skipping loss plot because metrics file does not exist: {metrics_path}")
+        return
+
+    try:
+        import matplotlib
+
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+    except ImportError as exc:
+        print(f"Skipping loss plot because matplotlib is not installed: {exc}")
+        return
+
+    metrics = pd.read_csv(metrics_path)
+    if "epoch" not in metrics.columns:
+        print(f"Skipping loss plot because {metrics_path} has no epoch column")
+        return
+
+    # Lightning writes one sparse CSV row per logged metric. Grouping by epoch
+    # reconstructs the train/validation loss curves that were logged with
+    # on_epoch=True. If no validation split exists, the plot contains only train.
+    loss_series: dict[str, pd.Series] = {}
+    for metric_name, display_name in (("train_loss", "Train loss"), ("val_loss", "Validation loss")):
+        if metric_name not in metrics.columns:
+            continue
+
+        metric_rows = metrics[["epoch", metric_name]].dropna()
+        if metric_rows.empty:
+            continue
+
+        metric_rows["epoch"] = metric_rows["epoch"].astype(int)
+        loss_series[display_name] = metric_rows.groupby("epoch")[metric_name].last().sort_index()
+
+    if not loss_series:
+        print(f"Skipping loss plot because no train_loss or val_loss rows were found in {metrics_path}")
+        return
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    plt.figure(figsize=(8, 5))
+    for display_name, values in loss_series.items():
+        # Epochs are shown as 1-based labels because the saved checkpoints and
+        # console progress are easier to compare to human-readable epoch counts.
+        plt.plot(values.index + 1, values.values, marker="o", label=display_name)
+
+    plt.xlabel("Epoch")
+    plt.ylabel("Loss")
+    plt.title("Training and Validation Loss")
+    plt.grid(True, alpha=0.3)
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=160)
+    plt.close()
+    print(f"Saved loss plot to {output_path}")
+
+
+def move_tensor_batch_to_device(batch: dict[str, torch.Tensor], device: torch.device) -> dict[str, torch.Tensor]:
+    """Move one DataLoader batch to the device that currently holds the model."""
+    return {key: value.to(device) if isinstance(value, torch.Tensor) else value for key, value in batch.items()}
+
+
+def safe_filename_part(value: object) -> str:
+    """Convert row identifiers into a filesystem-safe filename fragment."""
+    text = str(value)
+    safe_text = "".join(character if character.isalnum() or character in ("-", "_", ".") else "_" for character in text)
+    return safe_text.strip("_") or "unknown"
+
+
 # =============================================================================
 # Fully connected baseline
 # =============================================================================
@@ -398,7 +470,7 @@ class FullyConnectedLightningModule(pl.LightningModule):
         loss = (per_example_loss * weights).mean()
 
         # Accuracy is deliberately unweighted so it remains easy to interpret.
-        predictions = (torch.sigmoid(logits) >= 0.5).float()
+        predictions = (torch.sigmoid(logits) >= INTERACTION_THRESHOLD).float()
         accuracy = (predictions == labels).float().mean()
 
         self.log(f"{stage}_loss", loss, prog_bar=True, on_step=False, on_epoch=True, batch_size=labels.size(0))
@@ -459,6 +531,8 @@ class DScriptDataset(Dataset):
 
         # Positive examples should have a real contact map. Negative examples
         # usually do not; None is allowed and becomes an all -1 padded target.
+        # When a map exists, its -1 cells later mask unresolved residue pairs out
+        # of both contact supervision and interaction-score pooling.
         contact_map = self.load_contact_map(row.contact_map_path, embedding_1.shape[0], embedding_2.shape[0])
 
         return {
@@ -526,6 +600,7 @@ def collate_dscript_batch(items: list[dict[str, object]]) -> dict[str, torch.Ten
     # "unknown". This means padded cells and genuinely unknown cells are both
     # ignored by the contact-map loss.
     contact_maps = torch.full((batch_size, max_residues_1, max_residues_2), -1.0, dtype=torch.float32)
+    interaction_pair_masks = torch.zeros((batch_size, max_residues_1, max_residues_2), dtype=torch.bool)
 
     for batch_index, item in enumerate(items):
         embedding_1 = item["embedding_1"]
@@ -546,8 +621,18 @@ def collate_dscript_batch(items: list[dict[str, object]]) -> dict[str, torch.Ten
         contact_map = item["contact_map"]
         if contact_map is not None:
             # Real contact maps are copied into the same top-left valid region.
-            # Remaining cells stay -1 and are ignored by the loss.
+            # Remaining cells stay -1 and are ignored by the loss. For examples
+            # with structural supervision, interaction pooling uses only known
+            # residue pairs, so unresolved -1 cells cannot become unconstrained
+            # evidence for the pair-level interaction prediction.
             contact_maps[batch_index, :residues_1, :residues_2] = contact_map
+            interaction_pair_masks[batch_index, :residues_1, :residues_2] = contact_map >= 0
+        else:
+            # Examples without any contact map, usually synthetic/non-structural
+            # negatives, do not identify unresolved residues. Keep the previous
+            # behavior and allow all real residue pairs to contribute to the
+            # interaction objective for those examples.
+            interaction_pair_masks[batch_index, :residues_1, :residues_2] = True
 
     return {
         "embedding_1": embeddings_1,
@@ -555,6 +640,7 @@ def collate_dscript_batch(items: list[dict[str, object]]) -> dict[str, torch.Ten
         "mask_1": mask_1,
         "mask_2": mask_2,
         "contact_map": contact_maps,
+        "interaction_pair_mask": interaction_pair_masks,
         "label": torch.stack([item["label"] for item in items]),
         "loss_weight": torch.stack([item["loss_weight"] for item in items]),
         "dimer_type_index": torch.stack([item["dimer_type_index"] for item in items]),
@@ -741,9 +827,10 @@ class DScriptLightningModule(pl.LightningModule):
         embedding_2: torch.Tensor,
         mask_1: torch.Tensor,
         mask_2: torch.Tensor,
+        interaction_pair_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Run a batch through D-SCRIPT and return interaction logits."""
-        return self.model(embedding_1, embedding_2, mask_1, mask_2)
+        return self.model(embedding_1, embedding_2, mask_1, mask_2, interaction_pair_mask=interaction_pair_mask)
 
     def shared_step(self, batch: dict[str, torch.Tensor], stage: str) -> torch.Tensor:
         """Compute lambda-weighted interaction and contact-map losses."""
@@ -759,6 +846,7 @@ class DScriptLightningModule(pl.LightningModule):
             batch["embedding_2"],
             batch["mask_1"],
             batch["mask_2"],
+            interaction_pair_mask=batch["interaction_pair_mask"],
             return_contact_map=True,
             return_contact_logits=True,
         )
@@ -788,8 +876,9 @@ class DScriptLightningModule(pl.LightningModule):
         else:
             loss = interaction_loss
 
-        # Interaction classification still uses the usual 0.5 probability cutoff.
-        interaction_predictions = (torch.sigmoid(interaction_logits) >= 0.5).float()
+        # Interaction classification uses the same probability cutoff as the
+        # prediction export, so reported accuracy and saved labels agree.
+        interaction_predictions = (torch.sigmoid(interaction_logits) >= INTERACTION_THRESHOLD).float()
         interaction_accuracy = (interaction_predictions == labels).float().mean()
 
         batch_size = labels.size(0)
@@ -993,6 +1082,259 @@ def build_data_module_and_model(
     return data_module, model
 
 
+def predict_interaction_logits(
+    model: pl.LightningModule,
+    batch: dict[str, torch.Tensor],
+) -> torch.Tensor:
+    """Return one raw interaction logit per pair for either supported model."""
+    # Prediction export intentionally mirrors the training/evaluation forward
+    # paths. The fully connected baseline receives one fixed vector per pair,
+    # while D-SCRIPT receives padded residue embeddings plus boolean masks that
+    # identify real residues versus padding.
+    if "features" in batch:
+        return model(batch["features"])
+
+    return model(
+        batch["embedding_1"],
+        batch["embedding_2"],
+        batch["mask_1"],
+        batch["mask_2"],
+        batch.get("interaction_pair_mask"),
+    )
+
+
+def make_prediction_dataloader(
+    data_module: pl.LightningDataModule,
+    dataset: Dataset,
+) -> DataLoader:
+    """Return an ordered DataLoader for prediction export."""
+    kwargs = {
+        "batch_size": data_module.batch_size,
+        "shuffle": False,
+        "num_workers": data_module.num_workers,
+    }
+
+    # D-SCRIPT examples have variable residue lengths. The same collate function
+    # used during training pads embeddings/maps and creates masks, so prediction
+    # sees the exact tensor shapes and padding semantics used for evaluation.
+    if isinstance(dataset, DScriptDataset):
+        kwargs["collate_fn"] = collate_dscript_batch
+
+    return DataLoader(dataset, **kwargs)
+
+
+def collect_split_predictions(
+    split_name: str,
+    dataset: Dataset,
+    data_module: pl.LightningDataModule,
+    model: pl.LightningModule,
+    device: torch.device,
+) -> pd.DataFrame:
+    """Score one split and return metadata with true/predicted labels."""
+    probabilities: list[float] = []
+    predicted_labels: list[int] = []
+
+    loader = make_prediction_dataloader(data_module, dataset)
+    with torch.inference_mode():
+        for batch in loader:
+            batch = move_tensor_batch_to_device(batch, device)
+            logits = predict_interaction_logits(model, batch)
+
+            # Interaction probabilities are sigmoid(logit) in [0, 1]. The
+            # predicted label uses the same threshold as the training metrics:
+            # probability >= 0.5 means predicted interaction label 1.
+            batch_probabilities = torch.sigmoid(logits).detach().cpu()
+            batch_predictions = (batch_probabilities >= INTERACTION_THRESHOLD).to(torch.long)
+            probabilities.extend(batch_probabilities.tolist())
+            predicted_labels.extend(batch_predictions.tolist())
+
+    metadata = dataset.examples.reset_index(drop=True).copy()
+    if len(metadata) != len(probabilities):
+        raise RuntimeError(
+            f"Prediction count mismatch for {split_name}: "
+            f"{len(probabilities)} predictions for {len(metadata)} rows"
+        )
+
+    if "split" not in metadata.columns:
+        metadata.insert(0, "split", split_name)
+
+    metadata["label"] = pd.to_numeric(metadata["label"], errors="raise").astype("int64")
+    metadata["predicted_label"] = predicted_labels
+    metadata["predicted_probability"] = probabilities
+
+    # Keep identifiers and labels near the front, while excluding heavy/internal
+    # training columns such as raw sequences, embedding paths, and loss weights.
+    preferred_columns = [
+        "split",
+        "entity_pair",
+        "new_cluster_pair",
+        "entity_1",
+        "entity_2",
+        "cluster_1",
+        "cluster_2",
+        "pdb_id",
+        "assembly_number",
+        "dimer_type",
+        "label",
+        "predicted_label",
+        "predicted_probability",
+    ]
+    excluded_columns = {
+        "sequence_1",
+        "sequence_2",
+        "embedding_path_1",
+        "embedding_path_2",
+        "contact_map_path",
+        "loss_weight",
+    }
+    output_columns = [column for column in preferred_columns if column in metadata.columns]
+    output_columns.extend(
+        column for column in metadata.columns if column not in output_columns and column not in excluded_columns
+    )
+    return metadata[output_columns]
+
+
+def save_prediction_table(
+    data_module: pl.LightningDataModule,
+    model: pl.LightningModule,
+    output_path: Path,
+) -> None:
+    """Save labels, predicted labels, and probabilities for test-set rows."""
+    model.eval()
+    device = next(model.parameters()).device
+
+    # The prediction table is intentionally restricted to held-out test rows.
+    # Train/validation labels are still used for fitting and model selection,
+    # but they are not exported here to keep the final list focused on the
+    # unbiased evaluation split.
+    if data_module.test_dataset is None or len(data_module.test_dataset) == 0:
+        print("Skipping prediction export because no test rows are available")
+        return
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    predictions = collect_split_predictions("test", data_module.test_dataset, data_module, model, device)
+    predictions.to_csv(output_path, sep="\t", index=False)
+    print(f"Saved test predictions for {len(predictions)} examples to {output_path}")
+
+
+def save_contact_map_png(
+    matrix: np.ndarray,
+    output_path: Path,
+    title: str,
+    value_label: str,
+    vmin: float,
+    vmax: float,
+) -> None:
+    """Save one residue-by-residue contact matrix as a PNG heatmap."""
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    figure, axis = plt.subplots(figsize=(6, 5))
+    image = axis.imshow(matrix, aspect="auto", interpolation="nearest", vmin=vmin, vmax=vmax, cmap="viridis")
+    axis.set_xlabel("Protein 2 residue index")
+    axis.set_ylabel("Protein 1 residue index")
+    axis.set_title(title)
+    colorbar = figure.colorbar(image, ax=axis)
+    colorbar.set_label(value_label)
+    figure.tight_layout()
+    figure.savefig(output_path, dpi=160)
+    plt.close(figure)
+
+
+def contact_map_sample_stem(row: pd.Series, sample_number: int, test_index: int) -> str:
+    """Build a readable filename stem for one exported test contact-map sample."""
+    # PDB/assembly ids are the clearest structural identifiers for D-SCRIPT
+    # contact maps. If they are unavailable, fall back to cluster ids and the
+    # original test-set row index.
+    if "pdb_id" in row and pd.notna(row.pdb_id):
+        assembly = f"_assembly{int(row.assembly_number)}" if pd.notna(row.get("assembly_number")) else ""
+        identifier = f"{row.pdb_id}{assembly}"
+    elif "new_cluster_pair" in row and pd.notna(row.new_cluster_pair):
+        identifier = row.new_cluster_pair
+    else:
+        identifier = f"test_index_{test_index}"
+
+    return f"sample_{sample_number:02d}_test_index_{test_index}_{safe_filename_part(identifier)}"
+
+
+def save_test_contact_map_samples(
+    data_module: pl.LightningDataModule,
+    model: pl.LightningModule,
+    output_dir: Path,
+    sample_count: int = CONTACT_MAP_SAMPLE_COUNT,
+) -> None:
+    """Save predicted and true contact maps for random test examples with labels."""
+    if not isinstance(data_module.test_dataset, DScriptDataset) or not isinstance(model, DScriptLightningModule):
+        print("Skipping contact-map PNG export because contact maps are only available for the D-SCRIPT model")
+        return
+
+    test_dataset = data_module.test_dataset
+    examples = test_dataset.examples
+    candidates = examples.index[examples["contact_map_path"].notna()].to_numpy()
+    if len(candidates) == 0:
+        print("Skipping contact-map PNG export because no test rows have true contact maps")
+        return
+
+    try:
+        import matplotlib  # noqa: F401
+    except ImportError as exc:
+        print(f"Skipping contact-map PNG export because matplotlib is not installed: {exc}")
+        return
+
+    # Draw without replacement from test rows that have a true contact map. This
+    # avoids negative/synthetic rows where the contact target is entirely unknown
+    # and therefore cannot be shown as a ground-truth map.
+    sample_size = min(sample_count, len(candidates))
+    sampled_indices = np.random.default_rng().choice(candidates, size=sample_size, replace=False)
+
+    model.eval()
+    device = next(model.parameters()).device
+    for sample_number, test_index in enumerate(sampled_indices, start=1):
+        item = test_dataset[int(test_index)]
+        batch = collate_dscript_batch([item])
+        batch = move_tensor_batch_to_device(batch, device)
+
+        with torch.inference_mode():
+            _, predicted_contact_map = model.model(
+                batch["embedding_1"],
+                batch["embedding_2"],
+                batch["mask_1"],
+                batch["mask_2"],
+                interaction_pair_mask=batch["interaction_pair_mask"],
+                return_contact_map=True,
+            )
+
+        # With a one-example batch, the collated tensors have no padding beyond
+        # the current pair's true lengths. Predicted values are probabilities in
+        # [0, 1]; true values use -1 unknown, 0 non-contact, and 1 contact.
+        predicted_map = predicted_contact_map[0].detach().cpu().numpy()
+        true_map = batch["contact_map"][0].detach().cpu().numpy()
+        row = examples.iloc[int(test_index)]
+        stem = contact_map_sample_stem(row, sample_number, int(test_index))
+
+        save_contact_map_png(
+            predicted_map,
+            output_dir / f"{stem}_predicted_contact_map.png",
+            "Predicted Contact Probability",
+            "Probability",
+            vmin=0.0,
+            vmax=1.0,
+        )
+        save_contact_map_png(
+            true_map,
+            output_dir / f"{stem}_true_contact_map.png",
+            "True Contact Map",
+            "Label (-1 unknown, 0 no contact, 1 contact)",
+            vmin=-1.0,
+            vmax=1.0,
+        )
+
+    print(f"Saved predicted and true contact-map PNGs for {sample_size} test examples to {output_dir}")
+
+
 def main() -> None:
     """Wire the data module, model, trainer, and final test run together."""
     args = parse_args()
@@ -1034,12 +1376,14 @@ def main() -> None:
             save_last=True,
         )
 
+    csv_logger = CSVLogger(save_dir=args.output_dir, name="metrics")
     trainer = pl.Trainer(
         max_epochs=args.max_epochs,
         accelerator=args.accelerator,
         devices=int(args.devices) if args.devices.isdigit() else args.devices,
         default_root_dir=args.output_dir,
         callbacks=[checkpoint_callback],
+        logger=csv_logger,
         log_every_n_steps=args.log_every_n_steps,
     )
 
@@ -1049,6 +1393,19 @@ def main() -> None:
         # If validation existed, test the best validation checkpoint. Otherwise
         # test the current final weights.
         trainer.test(model, datamodule=data_module, ckpt_path="best" if has_validation else None)
+
+    prediction_model = model
+    if has_validation and checkpoint_callback.best_model_path:
+        # The prediction table should describe the same selected model as the
+        # validation-based checkpoint/test result, not necessarily the final
+        # epoch weights after training.
+        prediction_model = type(model).load_from_checkpoint(checkpoint_callback.best_model_path)
+        prediction_model.to(trainer.strategy.root_device)
+
+    csv_logger.save()
+    save_loss_plot(Path(csv_logger.log_dir) / "metrics.csv", args.output_dir / "loss_curve.png")
+    save_prediction_table(data_module, prediction_model, args.output_dir / "test_predictions.tsv")
+    save_test_contact_map_samples(data_module, prediction_model, args.output_dir / "contact_maps")
 
 
 if __name__ == "__main__":
