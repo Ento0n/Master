@@ -221,7 +221,7 @@ Script: `data/calculate_all_vs_all_sequence_identity.py`
 Command:
 
 ```bash
-python data/calculate_all_vs_all_sequence_identity.py
+python data/calculate_all_vs_all_sequence_identity.py --local --global
 ```
 
 Purpose:
@@ -230,6 +230,8 @@ Purpose:
 - Uses `edlib` in two modes:
   - local/HW mode, with the shorter sequence as query, for CD-HIT-style local identity.
   - global/NW mode for global identity.
+- Requires at least one of `--local` or `--global`. Use both flags to reproduce the old calculation scope.
+- Stores only the upper triangle of the symmetric all-vs-all result in compact `float32` NumPy arrays and streams the long-format TSV directly to disk.
 
 Inputs:
 
@@ -240,11 +242,12 @@ Outputs:
 
 | Output | Description |
 | --- | --- |
-| `own_all_vs_all/local_all_vs_all_sequence_identity.tsv` | Square matrix of local identities. |
-| `own_all_vs_all/global_all_vs_all_sequence_identity.tsv` | Square matrix of global identities. |
-| `own_all_vs_all/all_vs_all_sequence_identity_long_format.tsv` | Long-format pairwise identity table. |
+| `own_all_vs_all/local_all_vs_all_sequence_identity.triu.npy` | Compact upper-triangular local identities, written when `--local` is set. |
+| `own_all_vs_all/global_all_vs_all_sequence_identity.triu.npy` | Compact upper-triangular global identities, written when `--global` is set. |
+| `own_all_vs_all/all_vs_all_sequence_identity_cluster_order.tsv` | Cluster order for interpreting triangular arrays. |
+| `own_all_vs_all/all_vs_all_sequence_identity_long_format.tsv` | Streamed upper-triangular pairwise identity table, unless `--no-long-format` is set. |
 
-Resource note: the Slurm wrapper requests `512G` memory, which reflects the all-vs-all matrix size.
+Compatibility note: pass `--write-square-tsv` to also write the old dense square matrix TSVs. This avoids pandas materialization but still creates very large files.
 
 ## Step 7: Create Graphs
 
@@ -296,7 +299,14 @@ Purpose:
 Inputs:
 
 - `/nfs/scratch/pdb_dimers/final_filtered_interactions.tsv`
-- `/nfs/scratch/pdb_dimers/own_all_vs_all/local_all_vs_all_sequence_identity.tsv`
+- `/nfs/scratch/pdb_dimers/own_all_vs_all/local_all_vs_all_sequence_identity.triu.npy`
+- `/nfs/scratch/pdb_dimers/own_all_vs_all/all_vs_all_sequence_identity_cluster_order.tsv`
+
+Implementation notes:
+
+- The triangular NumPy array is loaded with `mmap_mode="r"` and indexed through the cluster-order file.
+- Diagonal lookups are treated as `1.0`, because a cluster compared to itself has 100% sequence identity.
+- The graph is written row-by-row instead of materializing the complete adjacency list in memory.
 
 Output:
 
