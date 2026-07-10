@@ -1221,26 +1221,76 @@ def save_contact_map_png(
     matrix: np.ndarray,
     output_path: Path,
     title: str,
-    value_label: str,
-    vmin: float,
-    vmax: float,
 ) -> None:
-    """Save one residue-by-residue contact matrix as a PNG heatmap."""
+    """Save one residue-by-residue contact matrix as a categorical PNG."""
     import matplotlib
 
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
+    from matplotlib.colors import BoundaryNorm, ListedColormap
+    from matplotlib.patches import Patch
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    # Contact maps are categorical, not continuous:
+    #   -1 = unknown/unresolved residue pair or padding,
+    #    0 = known non-contact,
+    #    1 = known contact.
+    # Predicted maps are thresholded before this function, so their cells are 0/1.
+    label_colors = {
+        -1: "#bdbdbd",
+        0: "#f7f7f7",
+        1: "#d73027",
+    }
+    color_map = ListedColormap(
+        [label_colors[-1], label_colors[0], label_colors[1]],
+        name="contact_map_labels",
+    )
+    color_norm = BoundaryNorm([-1.5, -0.5, 0.5, 1.5], color_map.N)
+
     figure, axis = plt.subplots(figsize=(6, 5))
-    image = axis.imshow(matrix, aspect="auto", interpolation="nearest", vmin=vmin, vmax=vmax, cmap="viridis")
+    axis.imshow(
+        matrix,
+        aspect="auto",
+        interpolation="nearest",
+        cmap=color_map,
+        norm=color_norm,
+    )
     axis.set_xlabel("Protein 2 residue index")
     axis.set_ylabel("Protein 1 residue index")
     axis.set_title(title)
-    colorbar = figure.colorbar(image, ax=axis)
-    colorbar.set_label(value_label)
+
+    # The same legend is used for true and predicted maps so exported PNGs can be
+    # compared directly. Predicted maps may not contain -1, but true maps can.
+    legend_handles = [
+        Patch(
+            facecolor=label_colors[1],
+            edgecolor="black",
+            linewidth=0.25,
+            label="1 contact",
+        ),
+        Patch(
+            facecolor=label_colors[0],
+            edgecolor="black",
+            linewidth=0.25,
+            label="0 no contact",
+        ),
+        Patch(
+            facecolor=label_colors[-1],
+            edgecolor="black",
+            linewidth=0.25,
+            label="-1 unknown",
+        ),
+    ]
+    axis.legend(
+        handles=legend_handles,
+        loc="upper center",
+        bbox_to_anchor=(0.5, -0.14),
+        ncol=3,
+        frameon=False,
+    )
     figure.tight_layout()
-    figure.savefig(output_path, dpi=160)
+    figure.savefig(output_path, dpi=160, bbox_inches="tight")
     plt.close(figure)
 
 
@@ -1308,28 +1358,26 @@ def save_test_contact_map_samples(
             )
 
         # With a one-example batch, the collated tensors have no padding beyond
-        # the current pair's true lengths. Predicted values are probabilities in
-        # [0, 1]; true values use -1 unknown, 0 non-contact, and 1 contact.
-        predicted_map = predicted_contact_map[0].detach().cpu().numpy()
-        true_map = batch["contact_map"][0].detach().cpu().numpy()
+        # the current pair's true lengths. The exported predicted map uses the
+        # same probability threshold as contact metrics, giving categorical 0/1
+        # cells. True maps keep the dataset convention: -1 unknown, 0 non-contact,
+        # and 1 contact.
+        predicted_map = (
+            predicted_contact_map[0].detach().cpu().numpy() >= model.contact_threshold
+        ).astype(np.int8)
+        true_map = batch["contact_map"][0].detach().cpu().numpy().astype(np.int8, copy=False)
         row = examples.iloc[int(test_index)]
         stem = contact_map_sample_stem(row, sample_number, int(test_index))
 
         save_contact_map_png(
             predicted_map,
             output_dir / f"{stem}_predicted_contact_map.png",
-            "Predicted Contact Probability",
-            "Probability",
-            vmin=0.0,
-            vmax=1.0,
+            f"Predicted Contact Map (threshold >= {model.contact_threshold:g})",
         )
         save_contact_map_png(
             true_map,
             output_dir / f"{stem}_true_contact_map.png",
             "True Contact Map",
-            "Label (-1 unknown, 0 no contact, 1 contact)",
-            vmin=-1.0,
-            vmax=1.0,
         )
 
     print(f"Saved predicted and true contact-map PNGs for {sample_size} test examples to {output_dir}")
