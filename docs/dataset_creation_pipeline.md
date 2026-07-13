@@ -444,7 +444,7 @@ Important arguments:
 | --- | --- | --- |
 | `--selection-tsv` | `/nfs/scratch/pdb_dimers/final_filtered_interactions_with_partitions.tsv` | Interaction rows to process. |
 | `--input-dir` | `/nfs/scratch/pdb_dimers/assemblies` | Folder with `.cif` or `.cif.gz` files. |
-| `--output-dir` | `/nfs/scratch/pdb_dimers/contact_maps` | Folder for `.npy` contact maps. |
+| `--output-dir` | `/nfs/scratch/pdb_dimers/contact_maps` | Folder for contact-map outputs. `.npy` maps are saved in `<output-dir>/data/`. |
 | `--summary-tsv` | `<output-dir>/contact_map_summary.tsv` | Optional custom summary output path. |
 | `--threshold` | `8.0` | Contact distance threshold in Angstrom. |
 | `--map-type` | `interface` | Only interface maps are currently supported. |
@@ -458,7 +458,7 @@ Outputs:
 
 | Output | Description |
 | --- | --- |
-| `contact_maps/*.npy` | One `int8` contact map per assembly. |
+| `contact_maps/data/*.npy` | One `int8` contact map per assembly. |
 | `contact_maps/contact_map_summary.tsv` | Audit trail of chain selection, residues, missing residues, contacts, unknown pairs, and shape. |
 
 ## Step 11: Filter Suspicious Contact Maps
