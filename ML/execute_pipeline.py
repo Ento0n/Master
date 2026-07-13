@@ -44,7 +44,7 @@ INTERACTION_THRESHOLD = 0.5
 DEFAULT_STRICT_FILE = Path("/nfs/scratch/pdb_dimers/balanced_interactions_strict.tsv")
 DEFAULT_SEQUENCE_FILE = Path("/nfs/scratch/pdb_dimers/entity_sequences.tsv")
 DEFAULT_EMBEDDING_MANIFEST = Path("/nfs/scratch/pdb_dimers/embeddings/esm2_t33_650M/manifest.tsv")
-DEFAULT_CONTACT_MAP_DIR = Path("/nfs/scratch/pdb_dimers/contact_maps")
+DEFAULT_CONTACT_MAP_DIR = Path("/nfs/scratch/pdb_dimers/contact_maps/data")
 CONTACT_MAP_SAMPLE_COUNT = 5
 
 
@@ -54,8 +54,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--model",
         choices=("dscript", "fully_connected"),
-        default="dscript",
-        help="Model family to train. Default: dscript.",
+        help="Model family to train.",
     )
     parser.add_argument(
         "--interactions",
