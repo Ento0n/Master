@@ -693,10 +693,10 @@ Purpose:
 
 Default balancing strategy:
 
-1. Sample as many negative homomers as possible from split-local sequences that are not known positive self-interactors.
-2. In strict mode, trim overflowing positive homomers so positive and negative homomer counts match.
-3. Keep all different-species heteromers and sample matching negative heteromers.
-4. Keep a same-species heteromer group only when the negative sampler can reproduce the exact sequence degree inside that species group.
+1. Keep all different-species heteromers and keep a same-species heteromer group only when the negative sampler can reproduce the exact sequence degree inside that species group.
+2. Sample as many negative homomers as possible from retained positive-set sequences that are not known positive self-interactors.
+3. In strict mode, trim overflowing positive homomers so positive and negative homomer counts match.
+4. Sample matching negative heteromers for the retained heteromer positives.
 
 `--keep-positive-homomers` changes step 2: all positive homomers are retained, and missing negative rows are filled with extra heteromer negatives guided by positive-vs-negative degree deficits.
 

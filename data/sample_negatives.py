@@ -6,13 +6,15 @@ interactions independently for each split, because train/val/test must each keep
 their own balance.
 
 Default sampling strategy inside each split:
-1. Create as many negative homomers as possible from positive-set sequences that
-   are not known positive self-interactors.  Sequence degree is ignored here.
-2. Remove overflowing positive homomers so positive and negative homomer counts
+1. Keep all different-species heteromers.  For same-species heteromers, keep a
+   species group only when matching negative heteromers can reproduce the exact
+   sequence degree within that group.
+2. Create as many negative homomers as possible from sequences that remain in
+   the kept positive endpoint pool and are not known positive self-interactors.
+   Sequence degree is ignored here.
+3. Remove overflowing positive homomers so positive and negative homomer counts
    match.
-3. Keep all different-species heteromers and sample matching negatives for them.
-4. For same-species heteromers, keep a species group only when matching negative
-   heteromers can reproduce the exact sequence degree within that group.
+4. Sample heteromer negatives for the retained heteromer positives.
 
 Every sampled negative pair is checked against all known positive pairs from the
 full input table, and against negative pairs already sampled in earlier splits.
@@ -447,12 +449,44 @@ def process_split(
     empty_negatives = add_helper_columns(empty_negatives, reset_order=True)
     print_stats("Initial positives in split", split_df, empty_negatives)
 
-    # Homomer negatives are self-pairs from split sequences that are not already
-    # positive self-interactors and not already sampled as negatives in another split.
     positive_homomers = split_df[split_df["_is_homo"]].sort_values("_row_order")
-    positive_clusters = set(split_df["_cluster_a"]) | set(split_df["_cluster_b"])
+
+    # Same-species heteromers are checked before homomer negatives are drawn.
+    # Otherwise a cluster that appears only in a same-species group removed below
+    # can still be sampled as a negative homomer and become negative-only in the
+    # final balanced output.
+    heteromers = split_df[~split_df["_is_homo"]].copy()
+    different_species_heteromers = heteromers[heteromers["_species_relation"] == "different_species"].copy()
+    same_species_heteromers = heteromers[heteromers["_species_relation"] == "same_species"].copy()
+
+    kept_same_species_groups: list[pd.DataFrame] = []
+    removed_same_species_groups: list[pd.DataFrame] = []
+    for species, species_group in same_species_heteromers.groupby("_species_key_a", sort=True):
+        can_sample_group = pair_same_species_counts(degree_counts(species_group), set(blocked_pairs)) is not None
+        if can_sample_group:
+            kept_same_species_groups.append(species_group)
+        else:
+            removed_same_species_groups.append(species_group)
+
+    kept_same_species_heteromers = concat_frames(kept_same_species_groups, split_df)
+    removed_same_species_heteromers = concat_frames(removed_same_species_groups, split_df)
+    kept_heteromers = concat_frames([kept_same_species_heteromers, different_species_heteromers], split_df)
+    kept_heteromers = kept_heteromers.sort_values("_row_order").reset_index(drop=True)
+
+    print("\nAfter removing same-species heteromer groups that cannot be mirrored")
+    print(f"  removed same-species positive heteromers: {len(removed_same_species_heteromers)}")
+    print_stats("  Heteromer positives kept before homomer sampling", kept_heteromers, empty_negatives)
+
+    # Homomer negatives are self-pairs from the retained positive endpoint pool
+    # that are not already positive self-interactors and not already sampled as
+    # negatives in another split.
+    retained_positive_clusters = set(kept_heteromers["_cluster_a"]) | set(kept_heteromers["_cluster_b"])
+    if keep_positive_homomers:
+        retained_positive_clusters.update(positive_homomers["_cluster_a"])
+        retained_positive_clusters.update(positive_homomers["_cluster_b"])
+
     eligible_homomer_clusters = sorted(
-        cluster for cluster in positive_clusters if canonical_pair(cluster, cluster) not in blocked_pairs
+        cluster for cluster in retained_positive_clusters if canonical_pair(cluster, cluster) not in blocked_pairs
     )
     homomer_negative_count = min(len(positive_homomers), len(eligible_homomer_clusters))
 
@@ -486,31 +520,10 @@ def process_split(
         print(f"  removed positive homomers: {removed_homomers}")
         print_stats("  Homomer-balanced positives", kept_homomers, negative_homomers)
 
-    # Same-species heteromers are checked per species.  A whole species group is
-    # removed when its sequence degrees cannot be mirrored by legal negatives.
-    heteromers = split_df[~split_df["_is_homo"]].copy()
-    different_species_heteromers = heteromers[heteromers["_species_relation"] == "different_species"].copy()
-    same_species_heteromers = heteromers[heteromers["_species_relation"] == "same_species"].copy()
-
-    kept_same_species_groups: list[pd.DataFrame] = []
-    removed_same_species_groups: list[pd.DataFrame] = []
-    for species, species_group in same_species_heteromers.groupby("_species_key_a", sort=True):
-        can_sample_group = pair_same_species_counts(degree_counts(species_group), set(blocked_pairs)) is not None
-        if can_sample_group:
-            kept_same_species_groups.append(species_group)
-        else:
-            removed_same_species_groups.append(species_group)
-
-    kept_same_species_heteromers = concat_frames(kept_same_species_groups, split_df)
-    removed_same_species_heteromers = concat_frames(removed_same_species_groups, split_df)
-    kept_heteromers = concat_frames([kept_same_species_heteromers, different_species_heteromers], split_df)
-    kept_heteromers = kept_heteromers.sort_values("_row_order").reset_index(drop=True)
-
     positives = concat_frames([kept_homomers, kept_heteromers], split_df)
     positives = positives.sort_values("_row_order").reset_index(drop=True)
 
-    print("\nAfter removing same-species heteromer groups that cannot be mirrored")
-    print(f"  removed same-species positive heteromers: {len(removed_same_species_heteromers)}")
+    print("\nAfter building positive set kept for negative sampling")
     print_stats("  Positive set kept for negative sampling", positives, negative_homomers)
 
     # Heteromer negatives are sampled against a split-local copy of the global
