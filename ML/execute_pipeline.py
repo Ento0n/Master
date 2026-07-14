@@ -8,6 +8,8 @@ interaction labels and available residue contact maps.
 from __future__ import annotations
 
 import argparse
+import os
+import random
 from pathlib import Path
 
 import numpy as np
@@ -46,6 +48,7 @@ DEFAULT_SEQUENCE_FILE = Path("/nfs/scratch/pdb_dimers/entity_sequences.tsv")
 DEFAULT_EMBEDDING_MANIFEST = Path("/nfs/scratch/pdb_dimers/embeddings/esm2_t33_650M/manifest.tsv")
 DEFAULT_CONTACT_MAP_DIR = Path("/nfs/scratch/pdb_dimers/contact_maps/data")
 CONTACT_MAP_SAMPLE_COUNT = 5
+DEFAULT_SEED = 42
 
 
 def parse_args() -> argparse.Namespace:
@@ -120,6 +123,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--devices", default="auto", help="Lightning devices, e.g. auto or 1.")
     parser.add_argument("--log-every-n-steps", type=int, default=50, help="How often Lightning logs progress.")
     parser.add_argument(
+        "--seed",
+        type=int,
+        default=DEFAULT_SEED,
+        help="Random seed used for model initialization, DataLoader shuffling, workers, and sample exports.",
+    )
+    parser.add_argument(
         "--limit-rows",
         type=int,
         default=None,
@@ -145,6 +154,61 @@ def validate_args(args: argparse.Namespace) -> None:
     # keeps each output cell centered on the same residue pair.
     if args.contact_width <= 0 or args.contact_width % 2 == 0:
         raise ValueError("--contact-width must be a positive odd integer")
+
+    # NumPy's process-wide seed expects a nonnegative 32-bit value. Reserve a
+    # few offset values because validation/test/prediction DataLoaders use
+    # seed + 1, seed + 2, and seed + 3 for independent deterministic generators.
+    if not 0 <= args.seed <= 2**32 - 4:
+        raise ValueError("--seed must be between 0 and 4294967292")
+
+
+def configure_reproducibility(seed: int) -> None:
+    """Seed every RNG used by the training pipeline and request deterministic kernels."""
+    # Python's hash seed is read when the interpreter starts. Setting it here
+    # still records the requested seed in child process environments, while the
+    # explicit RNG calls below control the randomness used by this script.
+    os.environ["PYTHONHASHSEED"] = str(seed)
+
+    # cuBLAS requires this environment variable when PyTorch deterministic
+    # algorithms are enabled on CUDA. It must be set before CUDA work starts.
+    os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
+
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    pl.seed_everything(seed, workers=True)
+
+    # Keep CUDA/cuDNN from selecting nondeterministic or benchmark-dependent
+    # kernels. Disabling TF32 avoids hardware-dependent matmul/conv precision
+    # changing the exact numeric trajectory of a seeded run.
+    if hasattr(torch.backends, "cudnn"):
+        torch.backends.cudnn.benchmark = False
+        torch.backends.cudnn.deterministic = True
+        if hasattr(torch.backends.cudnn, "allow_tf32"):
+            torch.backends.cudnn.allow_tf32 = False
+
+    if hasattr(torch.backends, "cuda") and hasattr(torch.backends.cuda, "matmul"):
+        torch.backends.cuda.matmul.allow_tf32 = False
+
+    torch.use_deterministic_algorithms(True)
+
+
+def seed_data_loader_worker(_worker_id: int) -> None:
+    """Seed Python and NumPy RNGs inside each DataLoader worker process."""
+    # PyTorch assigns each worker a deterministic torch.initial_seed() derived
+    # from the DataLoader generator. Mirroring that seed into Python/NumPy keeps
+    # any future random preprocessing inside workers reproducible as well.
+    worker_seed = torch.initial_seed() % 2**32
+    random.seed(worker_seed)
+    np.random.seed(worker_seed)
+
+
+def make_torch_generator(seed: int) -> torch.Generator:
+    """Create a fresh CPU generator for deterministic DataLoader behavior."""
+    generator = torch.Generator()
+    generator.manual_seed(seed)
+    return generator
 
 
 def split_pair(value: object, column_name: str) -> tuple[str, str]:
@@ -367,6 +431,7 @@ class FullyConnectedDataModule(pl.LightningDataModule):
         num_workers: int,
         loss_mode: str,
         limit_rows: int | None,
+        seed: int,
     ) -> None:
         super().__init__()
         self.interaction_path = interaction_path
@@ -376,6 +441,8 @@ class FullyConnectedDataModule(pl.LightningDataModule):
         self.num_workers = num_workers
         self.loss_mode = loss_mode
         self.limit_rows = limit_rows
+        self.seed = seed
+        self.train_generator = make_torch_generator(seed)
 
         self.train_dataset: FullyConnectedDataset | None = None
         self.val_dataset: FullyConnectedDataset | None = None
@@ -429,19 +496,40 @@ class FullyConnectedDataModule(pl.LightningDataModule):
 
     def train_dataloader(self) -> DataLoader:
         """Return shuffled training batches."""
-        return DataLoader(self.train_dataset, batch_size=self.batch_size, shuffle=True, num_workers=self.num_workers)
+        return DataLoader(
+            self.train_dataset,
+            batch_size=self.batch_size,
+            shuffle=True,
+            num_workers=self.num_workers,
+            worker_init_fn=seed_data_loader_worker,
+            generator=self.train_generator,
+        )
 
     def val_dataloader(self) -> DataLoader | None:
         """Return validation batches when a validation split exists."""
         if self.val_dataset is None or len(self.val_dataset) == 0:
             return None
-        return DataLoader(self.val_dataset, batch_size=self.batch_size, shuffle=False, num_workers=self.num_workers)
+        return DataLoader(
+            self.val_dataset,
+            batch_size=self.batch_size,
+            shuffle=False,
+            num_workers=self.num_workers,
+            worker_init_fn=seed_data_loader_worker,
+            generator=make_torch_generator(self.seed + 1),
+        )
 
     def test_dataloader(self) -> DataLoader | None:
         """Return test batches when a test split exists."""
         if self.test_dataset is None or len(self.test_dataset) == 0:
             return None
-        return DataLoader(self.test_dataset, batch_size=self.batch_size, shuffle=False, num_workers=self.num_workers)
+        return DataLoader(
+            self.test_dataset,
+            batch_size=self.batch_size,
+            shuffle=False,
+            num_workers=self.num_workers,
+            worker_init_fn=seed_data_loader_worker,
+            generator=make_torch_generator(self.seed + 2),
+        )
 
 
 class FullyConnectedLightningModule(pl.LightningModule):
@@ -658,6 +746,7 @@ class DScriptDataModule(pl.LightningDataModule):
         num_workers: int,
         loss_mode: str,
         limit_rows: int | None,
+        seed: int,
     ) -> None:
         super().__init__()
         self.interaction_path = interaction_path
@@ -667,6 +756,8 @@ class DScriptDataModule(pl.LightningDataModule):
         self.num_workers = num_workers
         self.loss_mode = loss_mode
         self.limit_rows = limit_rows
+        self.seed = seed
+        self.train_generator = make_torch_generator(seed)
 
         self.train_dataset: DScriptDataset | None = None
         self.val_dataset: DScriptDataset | None = None
@@ -766,6 +857,8 @@ class DScriptDataModule(pl.LightningDataModule):
             shuffle=True,
             num_workers=self.num_workers,
             collate_fn=collate_dscript_batch,
+            worker_init_fn=seed_data_loader_worker,
+            generator=self.train_generator,
         )
 
     def val_dataloader(self) -> DataLoader | None:
@@ -778,6 +871,8 @@ class DScriptDataModule(pl.LightningDataModule):
             shuffle=False,
             num_workers=self.num_workers,
             collate_fn=collate_dscript_batch,
+            worker_init_fn=seed_data_loader_worker,
+            generator=make_torch_generator(self.seed + 1),
         )
 
     def test_dataloader(self) -> DataLoader | None:
@@ -790,6 +885,8 @@ class DScriptDataModule(pl.LightningDataModule):
             shuffle=False,
             num_workers=self.num_workers,
             collate_fn=collate_dscript_batch,
+            worker_init_fn=seed_data_loader_worker,
+            generator=make_torch_generator(self.seed + 2),
         )
 
 
@@ -948,10 +1045,10 @@ class DScriptLightningModule(pl.LightningModule):
         # Average contact BCE within each supervised example first, then average
         # examples. This prevents large proteins/maps from dominating the contact
         # objective merely because they have more residue pairs.
-        per_example_known = known_mask_float.flatten(start_dim=1).sum(dim=1)
-        per_example_loss = (per_cell_loss * known_mask_float).flatten(start_dim=1).sum(dim=1)
-        per_example_loss = per_example_loss / per_example_known.clamp_min(1.0)
-        contact_loss = per_example_loss[per_example_known > 0].mean()
+        per_example_known = known_mask_float.flatten(start_dim=1).sum(dim=1)                    # [B, len1, len2] -> [B, len1 * len2] -> [B] For each sample how many are known
+        per_example_loss = (per_cell_loss * known_mask_float).flatten(start_dim=1).sum(dim=1)   # Same but with loss
+        per_example_loss = per_example_loss / per_example_known.clamp_min(1.0)                  # Average over how many known cells are present
+        contact_loss = per_example_loss[per_example_known > 0].mean()                           # Mean loss over examples, but exclude contact maps completely unknown
 
         # The threshold is used only for interpretable contact-map metrics. The
         # differentiable loss above still trains on raw logits.
@@ -1048,6 +1145,7 @@ def build_data_module_and_model(
             num_workers=args.num_workers,
             loss_mode=loss_mode,
             limit_rows=args.limit_rows,
+            seed=args.seed,
         )
         model = FullyConnectedLightningModule(
             input_dim=input_dim,
@@ -1067,6 +1165,7 @@ def build_data_module_and_model(
         num_workers=args.num_workers,
         loss_mode=loss_mode,
         limit_rows=args.limit_rows,
+        seed=args.seed,
     )
     model = DScriptLightningModule(
         embedding_dim=args.embedding_dim,
@@ -1107,10 +1206,13 @@ def make_prediction_dataloader(
     dataset: Dataset,
 ) -> DataLoader:
     """Return an ordered DataLoader for prediction export."""
+    seed = getattr(data_module, "seed", DEFAULT_SEED)
     kwargs = {
         "batch_size": data_module.batch_size,
         "shuffle": False,
         "num_workers": data_module.num_workers,
+        "worker_init_fn": seed_data_loader_worker,
+        "generator": make_torch_generator(seed + 3),
     }
 
     # D-SCRIPT examples have variable residue lengths. The same collate function
@@ -1314,6 +1416,7 @@ def save_test_contact_map_samples(
     model: pl.LightningModule,
     output_dir: Path,
     sample_count: int = CONTACT_MAP_SAMPLE_COUNT,
+    seed: int = DEFAULT_SEED,
 ) -> None:
     """Save predicted and true contact maps for random test examples with labels."""
     if not isinstance(data_module.test_dataset, DScriptDataset) or not isinstance(model, DScriptLightningModule):
@@ -1337,7 +1440,7 @@ def save_test_contact_map_samples(
     # avoids negative/synthetic rows where the contact target is entirely unknown
     # and therefore cannot be shown as a ground-truth map.
     sample_size = min(sample_count, len(candidates))
-    sampled_indices = np.random.default_rng().choice(candidates, size=sample_size, replace=False)
+    sampled_indices = np.random.default_rng(seed).choice(candidates, size=sample_size, replace=False)
 
     model.eval()
     device = next(model.parameters()).device
@@ -1386,6 +1489,7 @@ def main() -> None:
     """Wire the data module, model, trainer, and final test run together."""
     args = parse_args()
     validate_args(args)
+    configure_reproducibility(args.seed)
 
     # If no interaction file is passed, train on the strict balanced split. The
     # old keep_homomers file name is still detected for the dimer-type weighting
@@ -1432,6 +1536,7 @@ def main() -> None:
         callbacks=[checkpoint_callback],
         logger=csv_logger,
         log_every_n_steps=args.log_every_n_steps,
+        deterministic=True,
     )
 
     trainer.fit(model, datamodule=data_module)
@@ -1452,7 +1557,7 @@ def main() -> None:
     csv_logger.save()
     save_loss_plot(Path(csv_logger.log_dir) / "metrics.csv", args.output_dir / "loss_curve.png")
     save_prediction_table(data_module, prediction_model, args.output_dir / "test_predictions.tsv")
-    save_test_contact_map_samples(data_module, prediction_model, args.output_dir / "contact_maps")
+    save_test_contact_map_samples(data_module, prediction_model, args.output_dir / "contact_maps", seed=args.seed)
 
 
 if __name__ == "__main__":
