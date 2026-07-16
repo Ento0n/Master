@@ -10,6 +10,8 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
+import time
+
 import numpy as np
 import pandas as pd
 
@@ -859,10 +861,29 @@ class DScriptLightningModule(pl.LightningModule):
             reduction="none",
         )
         interaction_loss = (per_example_interaction_loss * weights).mean()
+
+        if contact_logits.is_cuda:
+            torch.cuda.synchronize(contact_logits.device)
+
+        start = time.perf_counter()
+
         contact_loss, contact_metrics = self.compute_contact_loss_and_metrics(
             contact_logits,
             contact_probabilities,
             batch,
+        )
+
+        if contact_logits.is_cuda:
+            torch.cuda.synchronize(contact_logits.device)
+        
+        self.log(
+            f"{stage}_contact_metrics_time_s",
+            time.perf_counter() - start,
+            on_step=False,
+            on_epoch=True,
+            reduce_fx="mean",
+            batch_size=1,
+            prog_bar=True,
         )
 
         # Lambda controls the tradeoff between the two tasks:
@@ -874,6 +895,15 @@ class DScriptLightningModule(pl.LightningModule):
             loss = self.interaction_loss_lambda * interaction_loss + (1.0 - self.interaction_loss_lambda) * contact_loss
         else:
             loss = interaction_loss
+        
+        mixed_loss = (
+            self.interaction_loss_lambda * interaction_loss + (1.0 - self.interaction_loss_lambda) * contact_loss
+        )
+        loss = torch.where(
+            contact_metrics["has_contact_supervision"],
+            mixed_loss,
+            interaction_loss,
+        )
 
         # Interaction classification uses the same probability cutoff as the
         # prediction export, so reported accuracy and saved labels agree.
@@ -922,7 +952,7 @@ class DScriptLightningModule(pl.LightningModule):
         batch: dict[str, torch.Tensor],
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor | int]]:
         """Compute contact BCE on known map cells and thresholded contact metrics."""
-        true_contact_map = batch["contact_map"]
+        true_contact_map = batch["contact_map"] # [B, len1, len2]
 
         # Contact targets use:
         #   1  = known contact,
@@ -930,34 +960,48 @@ class DScriptLightningModule(pl.LightningModule):
         #  -1  = unknown or padding.
         # Only cells with target >= 0 are supervised or counted in metrics.
         known_mask = true_contact_map >= 0
+
+        # If all contact maps are unknown, skip the rest
         known_contacts = int(known_mask.sum().item())
         if known_contacts == 0:
             zero = contact_logits.new_tensor(0.0)
-            return zero, {"known_contacts": 0}
+            return zero, {
+                "known_contacts": 0, 
+                "has_contact_supervision": torch.tensor(False, dtype=torch.bool, device=contact_logits.device)
+                }
 
-        # Clamp maps -1 -> 0 before BCE, then multiply by known_mask so those
-        # clamped unknown cells contribute exactly zero to the final loss.
-        contact_targets = true_contact_map.clamp_min(0.0)
-        per_cell_loss = F.binary_cross_entropy_with_logits(
-            contact_logits,
-            contact_targets,
+        known_logits = contact_logits[known_mask]
+        known_targets = true_contact_map[known_mask]
+
+        known_cell_losses = F.binary_cross_entropy_with_logits( # [B * known_cells]
+            known_logits,
+            known_targets,
             reduction="none",
         )
-        known_mask_float = known_mask.to(dtype=per_cell_loss.dtype)
 
-        # Average contact BCE within each supervised example first, then average
-        # examples. This prevents large proteins/maps from dominating the contact
-        # objective merely because they have more residue pairs.
-        per_example_known = known_mask_float.flatten(start_dim=1).sum(dim=1)
-        per_example_loss = (per_cell_loss * known_mask_float).flatten(start_dim=1).sum(dim=1)
-        per_example_loss = per_example_loss / per_example_known.clamp_min(1.0)
-        contact_loss = per_example_loss[per_example_known > 0].mean()
+        # extract the sum of loss over the loss tensor, length of the full batch
+        known_per_example = known_mask.flatten(start_dim=1).sum(dim=1) # [B]
+        loss_sum_per_example = torch.segment_reduce(
+            known_cell_losses,
+            reduce="sum",
+            lengths=known_per_example
+        )
 
+        supervised_examples = known_per_example > 0
+        loss_per_example = loss_sum_per_example / known_per_example.clamp_min(1.0)
+
+        supervised_count = supervised_examples.sum()
+        contact_loss = (
+            loss_per_example * supervised_examples.to(loss_per_example.dtype)
+        ).sum() / supervised_count.clamp_min(1)
+
+        # For torch.where whethere only interaction or mixed loss
+        has_contact_supervision = supervised_count > 0
+        
         # The threshold is used only for interpretable contact-map metrics. The
         # differentiable loss above still trains on raw logits.
-        targets = true_contact_map[known_mask]
         predicted_contacts = contact_probabilities[known_mask] >= self.contact_threshold
-        true_contacts = targets.bool()
+        true_contacts = known_targets.bool()
         contact_accuracy = (predicted_contacts == true_contacts).float().mean()
 
         # clamp_min(1.0) avoids NaN precision/recall in batches with no predicted
@@ -970,6 +1014,7 @@ class DScriptLightningModule(pl.LightningModule):
         recall = true_positives / actual_positive.clamp_min(1.0)
 
         return contact_loss, {
+            "has_contact_supervision": has_contact_supervision,
             "known_contacts": known_contacts,
             "contact_accuracy": contact_accuracy,
             "contact_precision": precision,
