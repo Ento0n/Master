@@ -892,11 +892,6 @@ class DScriptLightningModule(pl.LightningModule):
         #   lambda = 0.0 -> only contact-map prediction when maps are present.
         # If a batch has no known contact cells, falling back to interaction loss
         # avoids multiplying by a zero contact loss and wasting the batch.
-        if contact_metrics["known_contacts"] > 0:
-            loss = self.interaction_loss_lambda * interaction_loss + (1.0 - self.interaction_loss_lambda) * contact_loss
-        else:
-            loss = interaction_loss
-        
         mixed_loss = (
             self.interaction_loss_lambda * interaction_loss + (1.0 - self.interaction_loss_lambda) * contact_loss
         )
