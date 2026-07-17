@@ -88,6 +88,7 @@ def parse_args() -> argparse.Namespace:
         default=Path("ML/runs/dscript_interactions"),
         help="Where Lightning logs and checkpoints are written.",
     )
+    parser.add_argument("--output-subdir", type=str, required=True, help="Name for subdirectory in the output directory")
     parser.add_argument("--max-length", type=int, default=1250, help="One-hot baseline pad/truncate length.")
     parser.add_argument("--batch-size", type=int, default=16, help="Pairs per training batch.")
     parser.add_argument("--num-workers", type=int, default=4, help="DataLoader worker processes.")
@@ -1498,9 +1499,9 @@ def main() -> None:
         prediction_model.to(trainer.strategy.root_device)
 
     csv_logger.save()
-    save_loss_plot(Path(csv_logger.log_dir) / "metrics.csv", args.output_dir / "loss_curve.png")
-    save_prediction_table(data_module, prediction_model, args.output_dir / "test_predictions.tsv")
-    save_test_contact_map_samples(data_module, prediction_model, args.output_dir / "contact_maps")
+    save_loss_plot(Path(csv_logger.log_dir) / "metrics.csv", args.output_dir / args.output_subdir / "loss_curve.png")
+    save_prediction_table(data_module, prediction_model, args.output_dir / args.output_subdir / "test_predictions.tsv")
+    save_test_contact_map_samples(data_module, prediction_model, args.output_dir / args.output_subdir / "contact_maps")
 
 
 if __name__ == "__main__":

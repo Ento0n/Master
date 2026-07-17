@@ -279,7 +279,12 @@ class DScriptInteractionModel(nn.Module):
         # pair_mask removes batch padding; interaction_pair_mask can further
         # remove unresolved/unknown structure cells from true contact maps.
         pooling_mask = self._pooling_pair_mask(pair_mask, interaction_pair_mask)
-        logits = self._interaction_logits(contacts, pooling_mask)
+        # Interaction training must use a continuous pooling operation. A hard
+        # threshold such as ``(scores > 0.5).any(...)`` produces a Boolean
+        # tensor detached from autograd, so BCE cannot propagate gradients back
+        # into the contact and projection layers.
+        logits = self._any_contact_interaction_logits(contact_logits, pooling_mask)
+        # logits = self._interaction_logits(contacts, pooling_mask)
 
         if return_contact_map and return_contact_logits:
             return logits, contacts, contact_logits
@@ -288,6 +293,23 @@ class DScriptInteractionModel(nn.Module):
         if return_contact_map:
             return logits, contacts
         return logits
+
+    def _any_contact_interaction_logits(
+        self,
+        contact_logits: torch.Tensor,
+        pair_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        """Return one interaction logit per pair using max contact pooling."""
+        masked_logits = contact_logits.masked_fill(~pair_mask, -torch.inf)
+        interaction_logits = masked_logits.amax(dim=(1, 2))
+
+        # Handle a theoretically empty residue-pair mask safely.
+        has_valid_pair = pair_mask.any(dim=(1, 2))
+        return torch.where(
+            has_valid_pair,
+            interaction_logits,
+            torch.full_like(interaction_logits, -20.0),
+        )
 
     def _interaction_logits(self, contacts: torch.Tensor, pair_mask: torch.Tensor) -> torch.Tensor:
         """Pool contact probabilities into one raw interaction logit per pair."""
