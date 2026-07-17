@@ -1433,8 +1433,9 @@ def main() -> None:
     args = parse_args()
     validate_args(args)
 
-    # Set pytorch lightning seed
+    # Set pytorch lightning seed & set up tensor cores
     pl.seed_everything(42)
+    torch.set_float32_matmul_precision("high") # highest, high or medium
 
     # If no interaction file is passed, train on the strict balanced split. The
     # old keep_homomers file name is still detected for the dimer-type weighting
