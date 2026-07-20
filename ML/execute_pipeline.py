@@ -128,6 +128,7 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Optional small-row limit for quick debugging. Leave unset for real training.",
     )
+    parser.add_argument("--loss-type", default="contact", type=str, choices=("contact", "sparsity"), help="Which loss type to apply for the contact map")
     return parser.parse_args()
 
 
@@ -809,6 +810,7 @@ class DScriptLightningModule(pl.LightningModule):
         learning_rate: float,
         interaction_loss_lambda: float,
         contact_threshold: float,
+        loss_type: str,
     ) -> None:
         super().__init__()
         self.save_hyperparameters()
@@ -822,6 +824,7 @@ class DScriptLightningModule(pl.LightningModule):
         self.learning_rate = learning_rate
         self.interaction_loss_lambda = interaction_loss_lambda
         self.contact_threshold = contact_threshold
+        self.loss_type = loss_type
 
     def forward(
         self,
@@ -1009,8 +1012,34 @@ class DScriptLightningModule(pl.LightningModule):
         precision = true_positives / predicted_positive.clamp_min(1.0)
         recall = true_positives / actual_positive.clamp_min(1.0)
 
-        return contact_loss, {
+        # Sparsity loss
+        denominator = known_per_example.clamp_min(1).to(contact_probabilities.dtype)
+        predicted_sparsity = (
+            contact_probabilities.masked_fill(~known_mask, 0.0)
+            .flatten(start_dim=1)
+            .sum(dim=1)
+            / denominator
+        )
+        true_sparsity = (
+            true_contact_map.masked_fill(~known_mask, 1.0)
+            .flatten(start_dim=1)
+            .sum(dim=1)
+            / denominator
+        )
+        sparsity_loss = torch.abs(predicted_sparsity - true_sparsity)
+        sparsity_loss = (
+            sparsity_loss *
+            supervised_examples.to(sparsity_loss.dtype)
+        ).sum() / supervised_count.clamp_min(1.0)
+
+        if self.loss_type == "contact":
+            loss = contact_loss
+        else:
+            loss = sparsity_loss
+
+        return loss, {
             "has_contact_supervision": has_contact_supervision,
+            "predicted_contacts": predicted_contacts,
             "known_contacts": known_contacts,
             "contact_accuracy": contact_accuracy,
             "contact_precision": precision,
@@ -1118,6 +1147,7 @@ def build_data_module_and_model(
         learning_rate=args.learning_rate,
         interaction_loss_lambda=args.interaction_loss_lambda,
         contact_threshold=args.contact_threshold,
+        loss_type=args.loss_type,
     )
     return data_module, model
 
