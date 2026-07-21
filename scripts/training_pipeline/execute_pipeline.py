@@ -265,7 +265,11 @@ def save_loss_plot(metrics_path: Path, output_path: Path) -> None:
     # reconstructs the train/validation loss curves that were logged with
     # on_epoch=True. If no validation split exists, the plot contains only train.
     loss_series: dict[str, pd.Series] = {}
-    for metric_name, display_name in (("train_loss", "Train loss"), ("val_loss", "Validation loss")):
+    for metric_name, display_name in (
+        ("train_loss", "Train loss"), ("val_loss", "Validation loss"), 
+        ("train_interaction_loss", "Train Interaction Loss"), ("val_interaction_loss", "Validation Interaction Loss"), 
+        ("train_contact_loss", "Train Contact Loss"), ("val_contact_loss", "Validation Contact Loss")
+        ):
         if metric_name not in metrics.columns:
             continue
 
@@ -1094,8 +1098,24 @@ class DScriptLightningModule(pl.LightningModule):
         return self.shared_step(batch, "test")
 
     def configure_optimizers(self) -> torch.optim.Optimizer:
-        """Use Adam as a simple default optimizer."""
-        return torch.optim.Adam(self.parameters(), lr=self.learning_rate)
+        """Use Adam as a simple default optimizer and learning rate scheduler on plateau"""
+        optimizer = torch.optim.Adam(self.parameters(), lr=self.learning_rate)
+        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer,
+            mode="min",
+            factor=0.5,
+            patience=3,
+            min_lr=1e-6,
+        )
+        return {
+            "optimizer": optimizer,
+            "lr_scheduler": {
+                "scheduler": scheduler,
+                "monitor": "val_loss",
+                "interval": "epoch",
+                "frequency": 1,
+            },
+        }
 
 
 # =============================================================================
