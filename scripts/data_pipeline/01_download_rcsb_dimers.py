@@ -14,8 +14,7 @@ Criteria implemented:
 
 Default output:
   outdir/assemblies/*.cif.gz
-  outdir/selected_assemblies.tsv
-  outdir/all_candidate_assemblies.tsv
+  outdir/dataset_iterations/01_all_candidate_assemblies.tsv
 
 The TSV files include UniProt accessions for each side of the dimer when RCSB
 provides a mapping. Missing mappings are written as empty strings. If one PDB
@@ -540,6 +539,7 @@ def main() -> int:
 
     outdir = Path(args.outdir)
     assembly_dir = outdir / "assemblies"
+    dataset_dir = outdir / "dataset_iterations"
 
     # Extract asssemblies
     print("Searching RCSB for candidate protein-only dimer assemblies...", file=sys.stderr)
@@ -562,7 +562,7 @@ def main() -> int:
     # reps = select_representatives(candidates)
  
     # Write TSV files for all candidates and selected representatives
-    write_tsv(outdir / "all_candidate_assemblies.tsv", candidates)
+    write_tsv(dataset_dir / "01_all_candidate_assemblies.tsv", candidates)
     # write_tsv(outdir / "selected_assemblies.tsv", reps)
 
     print(f"Parsed {len(candidates)} candidate assemblies", file=sys.stderr)
@@ -578,7 +578,10 @@ def main() -> int:
             print(f"[{i}/{len(candidates)}] downloading {c.assembly_id}", file=sys.stderr)
             download_binary(c.download_url, dest)
 
-    print(f"Done. Representatives: {outdir / 'selected_assemblies.tsv'}", file=sys.stderr)
+    print(
+        f"Done. Candidate table: {dataset_dir / '01_all_candidate_assemblies.tsv'}",
+        file=sys.stderr,
+    )
     print(f"Finished RCSB protein dimer download at {datetime.now().isoformat(timespec='seconds')}", file=sys.stderr)
     return 0
 

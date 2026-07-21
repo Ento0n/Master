@@ -4,12 +4,17 @@ from datetime import datetime
 
 import pandas as pd
 
-DATA_DIR = "/nfs/scratch/pdb_dimers/"
+DATA_DIR = "/nfs/scratch/pdb_dimers"
+DATASET_DIR = os.path.join(DATA_DIR, "dataset_iterations")
+SEQUENCE_DIR = os.path.join(DATA_DIR, "sequences")
 
 def main():
     # Load the dataframes
-    seqs_df = pd.read_csv(os.path.join(DATA_DIR, "entity_sequences.tsv"), sep="\t")
-    int_df = pd.read_csv(os.path.join(DATA_DIR, "filtered_interactions.tsv"), sep="\t")
+    seqs_df = pd.read_csv(os.path.join(SEQUENCE_DIR, "entity_sequences.tsv"), sep="\t")
+    int_df = pd.read_csv(
+        os.path.join(DATASET_DIR, "02_filtered_by_seq_attributes.tsv"),
+        sep="\t",
+    )
 
     # Only keep rows in seqs_df that are present in int_df
     valid_entity_names = set()
@@ -70,8 +75,16 @@ def main():
     )
 
     # Save the new interaction dataframe and the new sequence-to-cluster mapping with the new cluster pairs to a new TSV file
-    int_df.to_csv(os.path.join(DATA_DIR, "filtered_interactions_with_clusters.tsv"), sep="\t", index=False)
-    sequence2clusterids_df.to_csv(os.path.join(DATA_DIR, "unique_sequences.tsv"), sep="\t", index=False)
+    int_df.to_csv(
+        os.path.join(DATASET_DIR, "03_new_clusters.tsv"),
+        sep="\t",
+        index=False,
+    )
+    sequence2clusterids_df.to_csv(
+        os.path.join(SEQUENCE_DIR, "unique_sequences.tsv"),
+        sep="\t",
+        index=False,
+    )
 
 if __name__ == "__main__":
     main()

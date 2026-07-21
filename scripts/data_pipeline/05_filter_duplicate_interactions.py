@@ -3,11 +3,12 @@ import os
 
 import pandas as pd
 
-DATA_DIR = "/nfs/scratch/pdb_dimers/"
+DATA_DIR = "/nfs/scratch/pdb_dimers"
+DATASET_DIR = os.path.join(DATA_DIR, "dataset_iterations")
 
 def main():
     # Load the interaction dataframe
-    int_df = pd.read_csv(os.path.join(DATA_DIR, "filtered_interactions_with_clusters.tsv"), sep="\t")
+    int_df = pd.read_csv(os.path.join(DATASET_DIR, "03_new_clusters.tsv"), sep="\t")
 
     # Identify duplicate interactions based on clusterpair in new_cluster_pair
     int_df["tmp_cluster_pair"] = int_df["new_cluster_pair"].apply(lambda x: ",".join(sorted(x.split(","))))
@@ -23,7 +24,11 @@ def main():
 
     # Save the filtered interactions to a new TSV file
     filtered_int_df.drop(columns=["tmp_cluster_pair"], inplace=True)
-    filtered_int_df.to_csv(os.path.join(DATA_DIR, "final_filtered_interactions.tsv"), sep="\t", index=False)
+    filtered_int_df.to_csv(
+        os.path.join(DATASET_DIR, "04_removed_duplicates.tsv"),
+        sep="\t",
+        index=False,
+    )
 
 if __name__ == "__main__":
     main()

@@ -1,7 +1,8 @@
 import pandas as pd
 
-INTERACTION_FILE = "/nfs/scratch/pdb_dimers/final_filtered_interactions_with_partitions.tsv"
+INTERACTION_FILE = "/nfs/scratch/pdb_dimers/dataset_iterations/05_KaHIP_partitions.tsv"
 SUMMARY_FILE = "/nfs/scratch/pdb_dimers/contact_maps/contact_map_summary.tsv"
+OUTPUT_FILE = "/nfs/scratch/pdb_dimers/dataset_iterations/06_removed_suspicious_contacts.tsv"
 
 def main():
     int_df = pd.read_csv(INTERACTION_FILE, sep="\t")
@@ -20,7 +21,8 @@ def main():
 
     print(f"Size after blacklisting: {len(int_df)}")
 
-    int_df.to_csv("/nfs/scratch/pdb_dimers/final_final_filtered_interactions_with_partitions.tsv", sep="\t")
+    # Do not add another dataframe index column to the next dataset iteration.
+    int_df.to_csv(OUTPUT_FILE, sep="\t", index=False)
 
 
 if __name__ == "__main__":

@@ -166,13 +166,15 @@ def format_identity(value: float) -> str:
 
 
 def load_sequences(data_dir: Path) -> pd.DataFrame:
+    sequence_file = data_dir / "sequences" / "unique_sequences.tsv"
+    interaction_file = data_dir / "dataset_iterations" / "04_removed_duplicates.tsv"
     seqs_df = pd.read_csv(
-        data_dir / "unique_sequences.tsv",
+        sequence_file,
         sep="\t",
         usecols=["new_cluster_id", "sequence"],
     )
     int_df = pd.read_csv(
-        data_dir / "final_filtered_interactions.tsv",
+        interaction_file,
         sep="\t",
         usecols=["new_cluster_pair"],
     )
@@ -183,8 +185,8 @@ def load_sequences(data_dir: Path) -> pd.DataFrame:
     if missing_clusters:
         preview = ", ".join(sorted(missing_clusters)[:10])
         raise ValueError(
-            f"{len(missing_clusters)} clusters from final_filtered_interactions.tsv "
-            f"are missing in unique_sequences.tsv. Examples: {preview}"
+            f"{len(missing_clusters)} clusters from {interaction_file} "
+            f"are missing in {sequence_file}. Examples: {preview}"
         )
 
     return seqs_df

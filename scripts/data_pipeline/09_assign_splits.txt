@@ -1,3 +1,6 @@
 Currently done with notebook: /nfs/home/students/a.spannagl/master_repository/notebooks/check_kahip_output.ipynb
 
+The split-assignment step reads dataset_iterations/04_removed_duplicates.tsv
+and saves dataset_iterations/05_KaHIP_partitions.tsv.
+
 Maybe implement a script to automate this ? A bit nicer for a pipeline (:

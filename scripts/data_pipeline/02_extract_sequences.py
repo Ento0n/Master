@@ -6,14 +6,19 @@ from numpy import block
 import pandas as pd
 import gemmi
 
-DATA_DIR = "/nfs/scratch/pdb_dimers/"
+DATA_DIR = "/nfs/scratch/pdb_dimers"
+DATASET_DIR = os.path.join(DATA_DIR, "dataset_iterations")
+SEQUENCE_DIR = os.path.join(DATA_DIR, "sequences")
 
 def main():
     # print timestamp
     print(f"Starting sequence extraction at {datetime.now().isoformat(timespec='seconds')}")
 
     # Load the selected assemblies
-    selected_assemblies = pd.read_csv(os.path.join(DATA_DIR, "all_candidate_assemblies.tsv"), sep="\t")
+    selected_assemblies = pd.read_csv(
+        os.path.join(DATASET_DIR, "01_all_candidate_assemblies.tsv"),
+        sep="\t",
+    )
 
     # Collect all unique entity names from the entity_pair column and the corresponding cluster ID
     entity_names = list()
@@ -129,7 +134,7 @@ def main():
             # convert dict to list of masks (one per sequence)
             entry = ""
             for asym_id in asym_ids:
-                entry += f"{asym_id}: {"".join(map(str, asym_id_to_residues_mask[asym_id]))}; "
+                entry += f"{asym_id}: {''.join(map(str, asym_id_to_residues_mask[asym_id]))}; "
             binary_masks.append(entry.strip())
 
 
@@ -151,10 +156,13 @@ def main():
         "binary_mask": binary_masks
     })
 
-    # Save the DataFrame to a TSV file
-    df.to_csv(os.path.join(DATA_DIR, "entity_sequences.tsv"), sep="\t", index=False)
+    # Sequence tables are reusable pipeline artifacts rather than interaction
+    # dataset iterations, so keep them in their own directory.
+    output_path = os.path.join(SEQUENCE_DIR, "entity_sequences.tsv")
+    os.makedirs(SEQUENCE_DIR, exist_ok=True)
+    df.to_csv(output_path, sep="\t", index=False)
 
-    print(f"Sequence extraction completed. Output saved to {os.path.join(DATA_DIR, 'entity_sequences.tsv')}")
+    print(f"Sequence extraction completed. Output saved to {output_path}")
     print(f"Finished sequence extraction at {datetime.now().isoformat(timespec='seconds')}")
                         
 

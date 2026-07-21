@@ -3,8 +3,8 @@ from datetime import datetime
 
 import pandas as pd
 
-INTERACTION_FILE = "/nfs/scratch/pdb_dimers/final_final_filtered_interactions_with_partitions.tsv"
-SEQUENCE_FILE = "/nfs/scratch/pdb_dimers/unique_sequences.tsv"
+INTERACTION_FILE = "/nfs/scratch/pdb_dimers/dataset_iterations/06_removed_suspicious_contacts.tsv"
+SEQUENCE_FILE = "/nfs/scratch/pdb_dimers/sequences/unique_sequences.tsv"
 
 OUTPUT_DIR = "/nfs/scratch/pdb_dimers/CD-HIT"
 

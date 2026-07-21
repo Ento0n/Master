@@ -18,10 +18,8 @@ from pathlib import Path
 import pandas as pd
 
 
-DEFAULT_INPUT = Path("/nfs/scratch/pdb_dimers/final_final_filtered_interactions_with_partitions.tsv")
-DEFAULT_OUTPUT = Path(
-    "/nfs/scratch/pdb_dimers/final_final_filtered_interactions_with_partitions_cd_hit.tsv"
-)
+DEFAULT_INPUT = Path("/nfs/scratch/pdb_dimers/dataset_iterations/06_removed_suspicious_contacts.tsv")
+DEFAULT_OUTPUT = Path("/nfs/scratch/pdb_dimers/dataset_iterations/07_cdhit.tsv")
 DEFAULT_VAL_CLUSTERS = Path("/nfs/scratch/pdb_dimers/CD-HIT/train_val.out")
 DEFAULT_TEST_CLUSTERS = Path("/nfs/scratch/pdb_dimers/CD-HIT/train_test.out")
 

@@ -8,6 +8,7 @@ import pandas as pd
 
 DATA_DIR = "/nfs/scratch/pdb_dimers"
 CLUSTER_ORDER_FILE = "all_vs_all_sequence_identity_cluster_order.tsv"
+INTERACTION_FILE = os.path.join("dataset_iterations", "04_removed_duplicates.tsv")
 
 
 def triangular_size(n_items: int) -> int:
@@ -99,7 +100,7 @@ def parse_cluster_pair_indices(
     if missing_clusters:
         preview = ", ".join(sorted(missing_clusters)[:10])
         raise ValueError(
-            f"{len(missing_clusters)} clusters from final_filtered_interactions.tsv "
+            f"{len(missing_clusters)} clusters from {INTERACTION_FILE} "
             f"are missing from the sequence identity cluster order. Examples: {preview}"
         )
 
@@ -108,7 +109,9 @@ def parse_cluster_pair_indices(
 
 def create_metis_interaction_graph(data_dir: str):
     # Load interacion dataframe
-    interaction_df = pd.read_csv(os.path.join(data_dir, "final_filtered_interactions.tsv"), sep="\t")
+    interaction_df = pd.read_csv(os.path.join(data_dir, INTERACTION_FILE), sep="\t")
+    graph_dir = os.path.join(data_dir, "graphs")
+    os.makedirs(graph_dir, exist_ok=True)
 
     # Create a integer cluster ID mapping
     unique_clusters = set()
@@ -144,7 +147,7 @@ def create_metis_interaction_graph(data_dir: str):
     print(f"Test: {list(cluster_connections.items())[:5]}")
 
     # Save the graph in METIS format
-    with open(os.path.join(data_dir, "KaHIP", "cluster.graph"), "w") as f:
+    with open(os.path.join(graph_dir, "cluster.graph"), "w") as f:
         # Write header, no of nodes and no of edges
         num_edges = sum(len(neighbors) for neighbors in cluster_connections.values()) // 2
         f.write(f"{len(cluster_connections)} {num_edges}\n")
@@ -153,7 +156,7 @@ def create_metis_interaction_graph(data_dir: str):
                 f.write(f"{neighbor} ")
             f.write("\n")
     
-    print(f"METIS graph saved to: {os.path.join(data_dir, 'KaHIP', 'cluster.graph')}")
+    print(f"METIS graph saved to: {os.path.join(graph_dir, 'cluster.graph')}")
 
 
 def interaction_weight(
@@ -173,7 +176,7 @@ def interaction_weight(
 
 
 def create_metis_sequence_identity_graph(data_dir: str, identity_metric: str):
-    int_df = pd.read_csv(os.path.join(data_dir, "final_filtered_interactions.tsv"), sep="\t")
+    int_df = pd.read_csv(os.path.join(data_dir, INTERACTION_FILE), sep="\t")
     identity_dir = os.path.join(data_dir, "own_all_vs_all")
     seq_identity = TriangularSequenceIdentity(
         values_path=os.path.join(
@@ -188,7 +191,7 @@ def create_metis_sequence_identity_graph(data_dir: str, identity_metric: str):
 
     n_nodes = len(pair_indices)
     n_edges = n_nodes * (n_nodes - 1) // 2
-    output_path = os.path.join(data_dir, "MMseqs2", "sequence_identity.graph")
+    output_path = os.path.join(data_dir, "graphs", "sequence_identity.graph")
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
 
     print(
@@ -228,7 +231,8 @@ def create_nx_graph_from_metis(data_dir: str):
 
     G = nx.Graph()
 
-    with open(os.path.join(data_dir, "KaHIP", "cluster.graph"), "r") as f:
+    graph_dir = os.path.join(data_dir, "graphs")
+    with open(os.path.join(graph_dir, "cluster.graph"), "r") as f:
         lines = [line.strip() for line in f if line.strip() and not line.startswith("%")]
 
     header = lines[0].split()
@@ -245,8 +249,8 @@ def create_nx_graph_from_metis(data_dir: str):
             if i < j:  # avoid adding undirected edges twice
                 G.add_edge(i, j)
 
-    nx.write_gexf(G, os.path.join(data_dir, "KaHIP", "cluster.graph.gexf"))
-    print(f"NetworkX graph saved to: {os.path.join(data_dir, 'KaHIP', 'cluster.graph.gexf')}")
+    nx.write_gexf(G, os.path.join(graph_dir, "cluster.graph.gexf"))
+    print(f"NetworkX graph saved to: {os.path.join(graph_dir, 'cluster.graph.gexf')}")
 
 def main():
     parser = argparse.ArgumentParser(description="Create a graph from the final filtered interactions and save it in METIS format.")

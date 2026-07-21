@@ -3,12 +3,17 @@ import os
 
 import pandas as pd
 
-DATA_DIR = "/nfs/scratch/pdb_dimers/"
+DATA_DIR = "/nfs/scratch/pdb_dimers"
+DATASET_DIR = os.path.join(DATA_DIR, "dataset_iterations")
+SEQUENCE_DIR = os.path.join(DATA_DIR, "sequences")
 
 def main():
     # load dataframes
-    interaction_df = pd.read_csv(os.path.join(DATA_DIR, "all_candidate_assemblies.tsv"), sep="\t")
-    seqs_df = pd.read_csv(os.path.join(DATA_DIR, "entity_sequences.tsv"), sep="\t")
+    interaction_df = pd.read_csv(
+        os.path.join(DATASET_DIR, "01_all_candidate_assemblies.tsv"),
+        sep="\t",
+    )
+    seqs_df = pd.read_csv(os.path.join(SEQUENCE_DIR, "entity_sequences.tsv"), sep="\t")
 
     # filter interactions by sequence length
     seqs_df["length"] = seqs_df["sequence"].apply(len)
@@ -45,7 +50,11 @@ def main():
     print(f"Interactions after filtering sequences with high unknown residues: {len(filtered_interaction_df)}")
 
     # Save the filtered interactions to a new TSV file
-    filtered_interaction_df.to_csv(os.path.join(DATA_DIR, "filtered_interactions.tsv"), sep="\t", index=False)
+    filtered_interaction_df.to_csv(
+        os.path.join(DATASET_DIR, "02_filtered_by_seq_attributes.tsv"),
+        sep="\t",
+        index=False,
+    )
 
 if __name__ == "__main__":
     main()

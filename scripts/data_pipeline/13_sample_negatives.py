@@ -33,8 +33,18 @@ from pathlib import Path
 import pandas as pd
 
 
-DEFAULT_INPUT = Path("/nfs/scratch/pdb_dimers/final_final_filtered_interactions_with_partitions.tsv")
-DEFAULT_OUTPUT = Path("/nfs/scratch/pdb_dimers/balanced_positive_negative_interactions.tsv")
+DATASET_DIR = Path("/nfs/scratch/pdb_dimers/dataset_iterations")
+DEFAULT_INPUT = DATASET_DIR / "06_removed_suspicious_contacts.tsv"
+CD_HIT_INPUT = DATASET_DIR / "07_cdhit.tsv"
+
+
+def default_output_path(input_file: Path, keep_positive_homomers: bool) -> Path:
+    """Choose the canonical final filename for the selected input and mode."""
+    mode = "keep_homomers" if keep_positive_homomers else "strict"
+    cd_hit_suffix = "_cd_hit" if input_file.name == CD_HIT_INPUT.name else ""
+    # Negative-inclusive datasets are final variants, so their names
+    # intentionally have no numeric iteration prefix.
+    return input_file.parent / f"balanced_interactions_{mode}{cd_hit_suffix}.tsv"
 
 
 def canonical_pair(cluster_a: str, cluster_b: str) -> tuple[str, str]:
@@ -789,7 +799,15 @@ def parse_args() -> argparse.Namespace:
         description="Sample split-wise balanced negative interactions from a positive interaction TSV."
     )
     parser.add_argument("--input", type=Path, default=DEFAULT_INPUT, help=f"Input TSV. Default: {DEFAULT_INPUT}")
-    parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT, help=f"Combined output TSV. Default: {DEFAULT_OUTPUT}")
+    parser.add_argument(
+        "--output",
+        type=Path,
+        default=None,
+        help=(
+            "Combined output TSV. By default, choose the canonical balanced_interactions_* "
+            "filename from --input and --keep-positive-homomers."
+        ),
+    )
     parser.add_argument("--positive-output", type=Path, default=None, help="Optional TSV for kept positives only.")
     parser.add_argument("--negative-output", type=Path, default=None, help="Optional TSV for sampled negatives only.")
     parser.add_argument(
@@ -802,6 +820,7 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
+    output_file = args.output or default_output_path(args.input, args.keep_positive_homomers)
     interactions, original_columns = load_and_prepare_interactions(args.input)
     split_order = list(interactions["split"].drop_duplicates())
 
@@ -838,14 +857,14 @@ def main() -> None:
     )
 
     write_outputs(
-        args.output,
+        output_file,
         balanced_positives,
         balanced_negatives,
         original_columns,
         args.positive_output,
         args.negative_output,
     )
-    print(f"\nWrote combined balanced dataset to {args.output}")
+    print(f"\nWrote combined balanced dataset to {output_file}")
 
 
 if __name__ == "__main__":

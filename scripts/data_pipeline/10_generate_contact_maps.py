@@ -45,7 +45,7 @@ except ImportError as exc:
 # Configuration and compact data containers
 # ---------------------------------------------------------------------------
 
-DEFAULT_SELECTION_TSV = "/nfs/scratch/pdb_dimers/final_filtered_interactions_with_partitions.tsv"
+DEFAULT_SELECTION_TSV = "/nfs/scratch/pdb_dimers/dataset_iterations/05_KaHIP_partitions.tsv"
 DEFAULT_INPUT_DIR = "/nfs/scratch/pdb_dimers/assemblies"
 DEFAULT_OUTPUT_DIR = "/nfs/scratch/pdb_dimers/contact_maps"
 DEFAULT_THRESHOLD_ANGSTROM = 8.0

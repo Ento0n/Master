@@ -11,7 +11,7 @@ from typing import Iterable
 import pandas as pd
 
 
-DEFAULT_INPUT = "/nfs/scratch/pdb_dimers/unique_sequences.tsv"
+DEFAULT_INPUT = "/nfs/scratch/pdb_dimers/sequences/unique_sequences.tsv"
 DEFAULT_OUTPUT_DIR = "/nfs/scratch/pdb_dimers/embeddings"
 
 MODEL_SPECS = {

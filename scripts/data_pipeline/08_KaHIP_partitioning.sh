@@ -1,5 +1,5 @@
 /nfs/home/students/a.spannagl/.local/kahip64/bin/kaffpa \
-  /nfs/scratch/pdb_dimers/MMseqs2/sequence_identity.graph \
+  /nfs/scratch/pdb_dimers/graphs/sequence_identity.graph \
   --k=10 \
   --preconfiguration=strong \
   --imbalance=3 \
