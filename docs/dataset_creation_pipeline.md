@@ -489,61 +489,7 @@ Output:
 
 Note: the current script writes with the default pandas index, so the output also contains a leading index column.
 
-## Step 12: Optional FASTA and Similarity Diagnostics
-
-### Whole-Dataset FASTA
-
-Script: `data/create_fasta.py`
-
-Command:
-
-```bash
-python data/create_fasta.py
-```
-
-Purpose:
-
-- Reads `unique_sequences_with_partitioning.tsv`.
-- Writes one FASTA record per sequence that has partition information.
-- FASTA headers use `<partition>|<cluster>`.
-
-Output:
-
-- `/nfs/scratch/pdb_dimers/unique_sequences.fasta`
-
-### MMseqs2 All-vs-All Diagnostic
-
-Slurm wrapper: `data/slurm/run_mmseqs.sh`
-
-Command:
-
-```bash
-mmseqs easy-search \
-  /nfs/scratch/pdb_dimers/unique_sequences.fasta \
-  /nfs/scratch/pdb_dimers/unique_sequences.fasta \
-  /nfs/scratch/pdb_dimers/MMseqs2/hits.tsv \
-  /nfs/scratch/pdb_dimers/MMseqs2/tmp \
-  --format-output query,target,pident,nident,alnlen,qcov,tcov,evalue,bits \
-  --min-seq-id 0.0 \
-  -c 0.0 \
-  --cov-mode 0 \
-  -s 7.5 \
-  --max-seqs 100000
-```
-
-Summary script:
-
-```bash
-python data/create_mmseqs2_summary.py
-```
-
-Output:
-
-- `/nfs/scratch/pdb_dimers/MMseqs2/partition_identity_summary.tsv`
-
-This diagnostic summarizes sequence identity between partitions based on MMseqs2 hits.
-
-## Step 13: Optional CD-HIT-2D Split Filtering
+## Step 12: CD-HIT-2D Split Filtering
 
 The handwritten workflow contains a branch labeled "without CD-HIT"; the repository supports both with-CD-HIT and without-CD-HIT final datasets.
 
@@ -648,7 +594,7 @@ Output:
 
 - `/nfs/scratch/pdb_dimers/final_final_filtered_interactions_with_partitions_cd_hit.tsv`
 
-## Step 14: Sample Negative Interactions
+## Step 13: Sample Negative Interactions
 
 Script: `data/sample_negatives.py`
 
@@ -724,7 +670,7 @@ Observed produced outputs in the current scratch directory:
 | `balanced_interactions_keep_homomers_cd_hit.tsv` | Keep-homomers variant after CD-HIT filtering. |
 | `balanced_interactions_strict_cd_hit.tsv` | Strict balancing after CD-HIT filtering. |
 
-## Optional Downstream Embeddings
+## Step 14: Embeddings
 
 Script: `data/generate_embeddings.py`
 
@@ -761,6 +707,60 @@ Important arguments:
 | `--force` | off | Regenerate existing outputs. |
 | `--limit` | none | Debug row limit. |
 | `--start-index`, `--end-index` | none | Row range for array jobs. |
+
+## Optional FASTA and Similarity Diagnostics
+
+### Whole-Dataset FASTA
+
+Script: `data/create_fasta.py`
+
+Command:
+
+```bash
+python data/create_fasta.py
+```
+
+Purpose:
+
+- Reads `unique_sequences_with_partitioning.tsv`.
+- Writes one FASTA record per sequence that has partition information.
+- FASTA headers use `<partition>|<cluster>`.
+
+Output:
+
+- `/nfs/scratch/pdb_dimers/unique_sequences.fasta`
+
+### MMseqs2 All-vs-All Diagnostic
+
+Slurm wrapper: `data/slurm/run_mmseqs.sh`
+
+Command:
+
+```bash
+mmseqs easy-search \
+  /nfs/scratch/pdb_dimers/unique_sequences.fasta \
+  /nfs/scratch/pdb_dimers/unique_sequences.fasta \
+  /nfs/scratch/pdb_dimers/MMseqs2/hits.tsv \
+  /nfs/scratch/pdb_dimers/MMseqs2/tmp \
+  --format-output query,target,pident,nident,alnlen,qcov,tcov,evalue,bits \
+  --min-seq-id 0.0 \
+  -c 0.0 \
+  --cov-mode 0 \
+  -s 7.5 \
+  --max-seqs 100000
+```
+
+Summary script:
+
+```bash
+python data/create_mmseqs2_summary.py
+```
+
+Output:
+
+- `/nfs/scratch/pdb_dimers/MMseqs2/partition_identity_summary.tsv`
+
+This diagnostic summarizes sequence identity between partitions based on MMseqs2 hits.
 
 ## Operational Notes
 

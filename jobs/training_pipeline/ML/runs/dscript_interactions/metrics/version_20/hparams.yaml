@@ -1,0 +1,8 @@
+contact_hidden_dim: 50
+contact_threshold: 0.5
+contact_width: 7
+embedding_dim: 1280
+interaction_loss_lambda: 0.5
+learning_rate: 0.001
+projection_dim: 100
+projection_dropout: 0.5

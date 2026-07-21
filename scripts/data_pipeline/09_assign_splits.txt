@@ -1,0 +1,3 @@
+Currently done with notebook: /nfs/home/students/a.spannagl/master_repository/notebooks/check_kahip_output.ipynb
+
+Maybe implement a script to automate this ? A bit nicer for a pipeline (:
