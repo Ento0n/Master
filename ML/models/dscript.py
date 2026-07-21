@@ -149,6 +149,7 @@ class DScriptInteractionModel(nn.Module):
         final_midpoint: float = 0.5,
         final_slope: float = 20.0,
         trainable_final_slope: bool = False,
+        interaction_module_type: str = "normal"
     ) -> None:
         super().__init__()
         # The model has three conceptual parts:
@@ -171,6 +172,8 @@ class DScriptInteractionModel(nn.Module):
         # interaction logit/probability.
         self.final_activation = LogisticActivation(final_midpoint, final_slope, trainable_final_slope)
         self.clip_parameters()
+
+        self.interaction_module_type = interaction_module_type
 
     def clip_parameters(self) -> None:
         """Clamp constrained parameters to the ranges used by D-SCRIPT."""
@@ -283,8 +286,11 @@ class DScriptInteractionModel(nn.Module):
         # threshold such as ``(scores > 0.5).any(...)`` produces a Boolean
         # tensor detached from autograd, so BCE cannot propagate gradients back
         # into the contact and projection layers.
-        logits = self._any_contact_interaction_logits(contact_logits, pooling_mask)
-        # logits = self._interaction_logits(contacts, pooling_mask)
+        if self.interaction_module_type == "normal":
+            logits = self._interaction_logits(contacts, pooling_mask)
+        else:
+            logits = self._any_contact_interaction_logits(contact_logits, pooling_mask)
+
 
         if return_contact_map and return_contact_logits:
             return logits, contacts, contact_logits

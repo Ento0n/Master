@@ -1,7 +1,7 @@
 import pandas as pd
 
 def main():
-    interactions = pd.read_csv("/nfs/scratch/pdb_dimers/final_filtered_interactions.tsv", sep="\t")
+    interactions = pd.read_csv("/nfs/scratch/pdb_dimers/final_final_filtered_interactions_with_partitions_cd_hit.tsv", sep="\t")
 
     output = interactions[["uniprot_1", "uniprot_2"]].copy()
 
@@ -14,7 +14,7 @@ def main():
 
     output.drop_duplicates(inplace=True)
 
-    output.to_csv("/nfs/scratch/pdb_dimers/pinder/pdb_interactions.tsv", sep="\t", index=None)
+    output.to_csv("/nfs/scratch/pdb_dimers/pinder/pdb_interactions.tsv", sep="\t", index=False)
 
 if __name__ == "__main__":
     main()

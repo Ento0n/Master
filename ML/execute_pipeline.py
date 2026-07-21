@@ -128,7 +128,8 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Optional small-row limit for quick debugging. Leave unset for real training.",
     )
-    parser.add_argument("--loss-type", default="contact", type=str, choices=("contact", "sparsity"), help="Which loss type to apply for the contact map")
+    parser.add_argument("--loss-type", default="contact", type=str, choices=("contact", "sparsity"), help="Which loss type to apply for the contact map, choices: contact, sparsity")
+    parser.add_argument("--int-mod-type", default="normal", type=str, choices=("normal", "max"), help="Which loss type to apply for the contact map, choices: normal, max")
     return parser.parse_args()
 
 
@@ -811,6 +812,7 @@ class DScriptLightningModule(pl.LightningModule):
         interaction_loss_lambda: float,
         contact_threshold: float,
         loss_type: str,
+        interaction_module_type: str,
     ) -> None:
         super().__init__()
         self.save_hyperparameters()
@@ -820,6 +822,7 @@ class DScriptLightningModule(pl.LightningModule):
             contact_hidden_dim=contact_hidden_dim,
             contact_width=contact_width,
             projection_dropout=projection_dropout,
+            interaction_module_type=interaction_module_type
         )
         self.learning_rate = learning_rate
         self.interaction_loss_lambda = interaction_loss_lambda
@@ -1148,6 +1151,7 @@ def build_data_module_and_model(
         interaction_loss_lambda=args.interaction_loss_lambda,
         contact_threshold=args.contact_threshold,
         loss_type=args.loss_type,
+        interaction_module_type=args.int_mod_type
     )
     return data_module, model
 
