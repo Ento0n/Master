@@ -1024,7 +1024,7 @@ class DScriptLightningModule(pl.LightningModule):
             / denominator
         )
         true_sparsity = (
-            true_contact_map.masked_fill(~known_mask, 1.0)
+            true_contact_map.masked_fill(~known_mask, 0.0)
             .flatten(start_dim=1)
             .sum(dim=1)
             / denominator

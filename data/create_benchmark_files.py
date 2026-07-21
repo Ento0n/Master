@@ -17,7 +17,7 @@ from pathlib import Path
 
 
 parser = argparse.ArgumentParser()
-parser.add_argument("--interactions-tsv", default="/nfs/scratch/pdb_dimers/final_filtered_interactions.tsv")
+parser.add_argument("--interactions-tsv", default="/nfs/scratch/pdb_dimers/final_final_filtered_interactions_with_partitions_cd_hit.tsv")
 parser.add_argument("--entity-sequences-tsv", default="/nfs/scratch/pdb_dimers/entity_sequences.tsv")
 parser.add_argument("--outdir", default="/nfs/scratch/pdb_dimers/ppi_splitting_pipeline")
 parser.add_argument("--batch-size", type=int, default=100)
