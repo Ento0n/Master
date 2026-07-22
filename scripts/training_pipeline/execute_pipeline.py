@@ -21,7 +21,7 @@ from torch.utils.data import DataLoader, Dataset
 
 import lightning.pytorch as pl
 from lightning.pytorch.callbacks import ModelCheckpoint
-from lightning.pytorch.loggers import CSVLogger
+from lightning.pytorch.loggers import CSVLogger, WandbLogger
 
 from scripts.models import DScriptInteractionModel, FullyConnectedInteractionModel
 
@@ -43,7 +43,7 @@ INTERACTION_THRESHOLD = 0.5
 # These defaults point at the current prepared dimer dataset. They can all be
 # overridden from the command line, which is useful for small debug subsets or
 # alternative embedding/contact-map directories.
-DEFAULT_STRICT_FILE = Path("/nfs/scratch/pdb_dimers/final_datasets/balanced_interactions_strict.tsv")
+DEFAULT_STRICT_FILE = Path("/nfs/scratch/pdb_dimers/final_datasets/balanced_interactions_strict_cd_hit.tsv")
 DEFAULT_SEQUENCE_FILE = Path("/nfs/scratch/pdb_dimers/sequences/entity_sequences.tsv")
 DEFAULT_EMBEDDING_MANIFEST = Path("/nfs/scratch/pdb_dimers/embeddings/esm2_t33_650M/manifest.tsv")
 DEFAULT_CONTACT_MAP_DIR = Path("/nfs/scratch/pdb_dimers/contact_maps/data")
@@ -89,9 +89,17 @@ def parse_args() -> argparse.Namespace:
         default=DEFAULT_OUTPUT_DIR,
         help="Where Lightning logs and checkpoints are written.",
     )
-    parser.add_argument("--output-subdir", type=str, required=True, help="Name for subdirectory in the output directory")
+    parser.add_argument(
+        "--output-subdir",
+        type=str,
+        default=None,
+        help=(
+            "Name for the output subdirectory. If omitted, it is built from "
+            "int-mod-type, loss-type, interaction-loss-lambda, and max-epochs."
+        ),
+    )
     parser.add_argument("--max-length", type=int, default=1250, help="One-hot baseline pad/truncate length.")
-    parser.add_argument("--batch-size", type=int, default=16, help="Pairs per training batch.")
+    parser.add_argument("--batch-size", type=int, default=8, help="Pairs per training batch.")
     parser.add_argument("--num-workers", type=int, default=4, help="DataLoader worker processes.")
     parser.add_argument("--max-epochs", type=int, default=10, help="Number of training epochs.")
     parser.add_argument("--learning-rate", type=float, default=1e-3, help="Adam learning rate.")
@@ -129,7 +137,12 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Optional small-row limit for quick debugging. Leave unset for real training.",
     )
-    parser.add_argument("--loss-type", default="contact", type=str, choices=("contact", "sparsity"), help="Which loss type to apply for the contact map, choices: contact, sparsity")
+    parser.add_argument(
+        "--loss-type", 
+        required=True,
+        type=str, 
+        choices=("contact", "sparsity_11", "sparsity_12", "sparsity_21", "sparsity_22"), 
+        help="Which loss type to apply for the contact map, choices: contact, sparsity")
     parser.add_argument("--int-mod-type", default="normal", type=str, choices=("normal", "max"), help="Which loss type to apply for the contact map, choices: normal, max")
     return parser.parse_args()
 
@@ -977,14 +990,7 @@ class DScriptLightningModule(pl.LightningModule):
                 "has_contact_supervision": torch.tensor(False, dtype=torch.bool, device=contact_logits.device)
                 }
 
-        known_logits = contact_logits[known_mask]
         known_targets = true_contact_map[known_mask]
-
-        known_cell_losses = F.binary_cross_entropy_with_logits( # [B * known_cells]
-            known_logits,
-            known_targets,
-            reduction="none",
-        )
 
         # extract the sum of loss over the loss tensor, length of the full batch
         known_per_example = known_mask.flatten(start_dim=1).sum(dim=1) # [B]
@@ -1012,6 +1018,13 @@ class DScriptLightningModule(pl.LightningModule):
 
         if self.loss_type == "contact":
             # Contact loss
+            known_logits = contact_logits[known_mask]
+            known_cell_losses = F.binary_cross_entropy_with_logits( # [B * known_cells]
+                known_logits,
+                known_targets,
+                reduction="none",
+            )
+
             loss_sum_per_example = torch.segment_reduce(
             known_cell_losses,
             reduce="sum",
@@ -1027,6 +1040,7 @@ class DScriptLightningModule(pl.LightningModule):
         else:
             # Sparsity loss
             denominator = known_per_example.clamp_min(1).to(contact_probabilities.dtype)
+            masked_targets = true_contact_map.masked_fill(~known_mask, 0.0)
             predicted_sparsity = (
                 contact_probabilities.masked_fill(~known_mask, 0.0)
                 .flatten(start_dim=1)
@@ -1034,12 +1048,35 @@ class DScriptLightningModule(pl.LightningModule):
                 / denominator
             )
             true_sparsity = (
-                true_contact_map.masked_fill(~known_mask, 0.0)
+                masked_targets
                 .flatten(start_dim=1)
                 .sum(dim=1)
                 / denominator
             )
-            sparsity_loss = torch.abs(predicted_sparsity - true_sparsity) + (1 - recall)
+
+            # recall per example, gradient friendly
+            positive_per_example = masked_targets.flatten(start_dim=1).sum(dim=1)  # [B]
+            soft_true_positives = (
+                contact_probabilities * masked_targets
+            ).flatten(start_dim=1).sum(dim=1)  # [B]
+
+            soft_recall = soft_true_positives / positive_per_example.clamp_min(1.0)
+            recall_error = torch.where(
+                positive_per_example > 0,
+                1.0 - soft_recall,
+                torch.zeros_like(soft_recall),
+            )
+            if self.loss_type == "sparsity_11":
+                sparsity_loss = torch.abs(predicted_sparsity - true_sparsity) + recall_error
+            elif self.loss_type == "sparsity_12":
+                sparsity_loss = torch.abs(predicted_sparsity - true_sparsity) + recall_error.square()
+            elif self.loss_type == "sparsity_21":
+                sparsity_loss = (predicted_sparsity - true_sparsity) ** 2 + recall_error
+            elif self.loss_type == "sparsity_22":
+                sparsity_loss = (predicted_sparsity - true_sparsity) ** 2 + recall_error.square()
+            else:
+                raise ValueError("Given loss type cannot be matched! This should not be reachable...")
+
             sparsity_loss = (
                 sparsity_loss *
                 supervised_examples.to(sparsity_loss.dtype)
@@ -1113,7 +1150,7 @@ class DScriptLightningModule(pl.LightningModule):
             "optimizer": optimizer,
             "lr_scheduler": {
                 "scheduler": scheduler,
-                "monitor": "val_loss",
+                "monitor": "val_interaction_loss",
                 "interval": "epoch",
                 "frequency": 1,
             },
@@ -1484,6 +1521,21 @@ def main() -> None:
     args = parse_args()
     validate_args(args)
 
+    # Build a compact, reproducible directory name for sweep runs while still
+    # allowing callers to provide a custom --output-subdir. Underscores inside
+    # values and the decimal point in lambda are removed; underscores between
+    # values make the four settings readable, e.g. normal_sparsity11_095_30.
+    if args.output_subdir is None:
+        interaction_loss_lambda = str(args.interaction_loss_lambda).replace(".", "")
+        args.output_subdir = "_".join(
+            (
+                args.int_mod_type.replace("_", ""),
+                args.loss_type.replace("_", ""),
+                interaction_loss_lambda,
+                str(args.max_epochs),
+            )
+        )
+
     # Set pytorch lightning seed & set up tensor cores
     pl.seed_everything(42)
     torch.set_float32_matmul_precision("high") # highest, high or medium
@@ -1509,7 +1561,7 @@ def main() -> None:
         checkpoint_callback = ModelCheckpoint(
             dirpath=args.output_dir / args.output_subdir / "checkpoints",
             filename=f"{args.model}" + "-{epoch:02d}-{val_loss:.4f}",
-            monitor="val_loss",
+            monitor="val_interaction_loss",
             mode="min",
             save_top_k=1,
             save_last=True,
@@ -1525,13 +1577,14 @@ def main() -> None:
         )
 
     csv_logger = CSVLogger(save_dir=args.output_dir / args.output_subdir, name="metrics")
+    wandb_logger = WandbLogger(project="master", log_model=False)
     trainer = pl.Trainer(
         max_epochs=args.max_epochs,
         accelerator=args.accelerator,
         devices=int(args.devices) if args.devices.isdigit() else args.devices,
         default_root_dir=args.output_dir / args.output_subdir,
         callbacks=[checkpoint_callback],
-        logger=csv_logger,
+        logger=[csv_logger, wandb_logger],
         log_every_n_steps=args.log_every_n_steps,
     )
 
