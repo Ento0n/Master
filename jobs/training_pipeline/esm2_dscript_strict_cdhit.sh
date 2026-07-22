@@ -16,21 +16,18 @@
 
 set -euo pipefail
 
-if [[ $# -lt 1 ]]; then 
-    echo "Usage: $0 <string>" >&2
-    exit 1
+# Passing a name remains supported for one-off runs. With no argument,
+# execute_pipeline generates the subdirectory name from the run settings.
+output_subdir_args=()
+if [[ $# -ge 1 ]]; then
+    output_subdir_args=(--output-subdir "$1")
 fi
-
-argument="$1"
 
 cd /nfs/home/students/a.spannagl/master_repository
 python -m scripts.training_pipeline.execute_pipeline \
   --model dscript \
-  --interactions /nfs/scratch/pdb_dimers/final_datasets/balanced_interactions_strict_cd_hit.tsv \
   --interaction-loss-lambda 0.5 \
-  --contact-threshold 0.5 \
-  --batch-size 8 \
   --max-epochs 10 \
-  --output-subdir "$argument" \
-  --loss-type sparsity \
+  "${output_subdir_args[@]}" \
+  --loss-type sparsity_11 \
   --int-mod-type normal

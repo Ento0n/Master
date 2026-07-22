@@ -1,0 +1,35 @@
+# sweep.yaml
+program: scripts/training_pipeline/execute_pipeline.py
+project: master
+
+method: bayes
+
+metric:
+  name: val_interaction_loss
+  goal: minimize
+
+parameters:
+  model:
+    value: dscript
+
+  interaction-loss-lambda:
+    distribution: log_uniform_values
+    min: 0.5
+    max: 0.95
+  
+  loss-type:
+    values: [contact, sparsity_11, sparsity_12, sparsity_21, sparsity_22]
+  
+  int-mod-type:
+    values: [normal, max]
+  
+  max-epochs:
+    value: 30
+  
+command:
+  - ${env}
+  - ${interpreter}
+  - "-m"
+  - scripts.training_pipeline.execute_pipeline
+  - ${args}
+  

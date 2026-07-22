@@ -4,3 +4,4 @@ server_handling.txt
 .codex
 **/__pycache__/*
 **/results/*
+**/wandb/*

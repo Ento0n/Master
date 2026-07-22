@@ -14,20 +14,10 @@
 #SBATCH --mail-type=END,FAIL                        # Mail events (NONE, BEGIN, END, FAIL, ALL)
 #SBATCH --mail-user=antspa@gmx.de                   # Where to send mail
 
-set -euo pipefail
-
-if [[ $# -lt 1 ]]; then
-    echo "Usage: $0 <string>" >&2
-    exit 1
-fi
-
-argument="$1"
-
-python ../execute_pipeline.py \
+cd /nfs/home/students/a.spannagl/master_repository
+python -m scripts.training_pipeline.execute_pipeline \
   --model dscript \
-  --interactions /nfs/scratch/pdb_dimers/balanced_interactions_strict_cd_hit.tsv \
-  --interaction-loss-lambda 0.95 \
-  --contact-threshold 0.5 \
-  --batch-size 8 \
-  --max-epochs 1 \
-  --output-subdir "$argument"
+  --interaction-loss-lambda 0.65 \
+  --int-mod-type normal \
+  --loss-type sparsity_21 \
+  --max-epochs 5 \
