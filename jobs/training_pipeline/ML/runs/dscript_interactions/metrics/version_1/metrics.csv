@@ -1,3 +1,0 @@
-epoch,step,train_accuracy,train_contact_accuracy,train_contact_loss,train_contact_precision,train_contact_recall,train_interaction_loss,train_loss,val_accuracy,val_contact_accuracy,val_contact_loss,val_contact_precision,val_contact_recall,val_interaction_loss,val_loss
-0,2448,,,,,,,,0.5,0.9971499443054199,0.08619513362646103,0.0009492362732999027,0.0002005334827117622,4.606089115142822,2.3461830615997314
-0,2448,0.5003063678741455,0.5093951225280762,0.9347373247146606,0.0018748353468254209,0.4898401200771332,1.2737387418746948,1.1044844388961792,,,,,,,

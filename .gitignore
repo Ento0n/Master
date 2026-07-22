@@ -3,3 +3,4 @@ server_handling.txt
 .vscode/
 .codex
 **/__pycache__/*
+**/results/*

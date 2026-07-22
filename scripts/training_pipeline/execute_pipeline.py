@@ -23,7 +23,7 @@ import lightning.pytorch as pl
 from lightning.pytorch.callbacks import ModelCheckpoint
 from lightning.pytorch.loggers import CSVLogger
 
-from models import DScriptInteractionModel, FullyConnectedInteractionModel
+from scripts.models import DScriptInteractionModel, FullyConnectedInteractionModel
 
 
 # =============================================================================
@@ -43,10 +43,11 @@ INTERACTION_THRESHOLD = 0.5
 # These defaults point at the current prepared dimer dataset. They can all be
 # overridden from the command line, which is useful for small debug subsets or
 # alternative embedding/contact-map directories.
-DEFAULT_STRICT_FILE = Path("/nfs/scratch/pdb_dimers/balanced_interactions_strict.tsv")
-DEFAULT_SEQUENCE_FILE = Path("/nfs/scratch/pdb_dimers/entity_sequences.tsv")
+DEFAULT_STRICT_FILE = Path("/nfs/scratch/pdb_dimers/final_datasets/balanced_interactions_strict.tsv")
+DEFAULT_SEQUENCE_FILE = Path("/nfs/scratch/pdb_dimers/sequences/entity_sequences.tsv")
 DEFAULT_EMBEDDING_MANIFEST = Path("/nfs/scratch/pdb_dimers/embeddings/esm2_t33_650M/manifest.tsv")
 DEFAULT_CONTACT_MAP_DIR = Path("/nfs/scratch/pdb_dimers/contact_maps/data")
+DEFAULT_OUTPUT_DIR = Path("/nfs/home/students/a.spannagl/master_repository/jobs/training_pipeline/results")
 CONTACT_MAP_SAMPLE_COUNT = 5
 
 
@@ -85,7 +86,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--output-dir",
         type=Path,
-        default=Path("ML/runs/dscript_interactions"),
+        default=DEFAULT_OUTPUT_DIR,
         help="Where Lightning logs and checkpoints are written.",
     )
     parser.add_argument("--output-subdir", type=str, required=True, help="Name for subdirectory in the output directory")
@@ -987,19 +988,9 @@ class DScriptLightningModule(pl.LightningModule):
 
         # extract the sum of loss over the loss tensor, length of the full batch
         known_per_example = known_mask.flatten(start_dim=1).sum(dim=1) # [B]
-        loss_sum_per_example = torch.segment_reduce(
-            known_cell_losses,
-            reduce="sum",
-            lengths=known_per_example
-        )
 
         supervised_examples = known_per_example > 0
-        loss_per_example = loss_sum_per_example / known_per_example.clamp_min(1.0)
-
         supervised_count = supervised_examples.sum()
-        contact_loss = (
-            loss_per_example * supervised_examples.to(loss_per_example.dtype)
-        ).sum() / supervised_count.clamp_min(1)
 
         # For torch.where whethere only interaction or mixed loss
         has_contact_supervision = supervised_count > 0
@@ -1019,29 +1010,40 @@ class DScriptLightningModule(pl.LightningModule):
         precision = true_positives / predicted_positive.clamp_min(1.0)
         recall = true_positives / actual_positive.clamp_min(1.0)
 
-        # Sparsity loss
-        denominator = known_per_example.clamp_min(1).to(contact_probabilities.dtype)
-        predicted_sparsity = (
-            contact_probabilities.masked_fill(~known_mask, 0.0)
-            .flatten(start_dim=1)
-            .sum(dim=1)
-            / denominator
-        )
-        true_sparsity = (
-            true_contact_map.masked_fill(~known_mask, 0.0)
-            .flatten(start_dim=1)
-            .sum(dim=1)
-            / denominator
-        )
-        sparsity_loss = torch.abs(predicted_sparsity - true_sparsity)
-        sparsity_loss = (
-            sparsity_loss *
-            supervised_examples.to(sparsity_loss.dtype)
-        ).sum() / supervised_count.clamp_min(1.0)
-
         if self.loss_type == "contact":
+            # Contact loss
+            loss_sum_per_example = torch.segment_reduce(
+            known_cell_losses,
+            reduce="sum",
+            lengths=known_per_example
+            )
+
+            loss_per_example = loss_sum_per_example / known_per_example.clamp_min(1.0)
+
+            contact_loss = (
+                loss_per_example * supervised_examples.to(loss_per_example.dtype)
+            ).sum() / supervised_count.clamp_min(1)
             loss = contact_loss
         else:
+            # Sparsity loss
+            denominator = known_per_example.clamp_min(1).to(contact_probabilities.dtype)
+            predicted_sparsity = (
+                contact_probabilities.masked_fill(~known_mask, 0.0)
+                .flatten(start_dim=1)
+                .sum(dim=1)
+                / denominator
+            )
+            true_sparsity = (
+                true_contact_map.masked_fill(~known_mask, 0.0)
+                .flatten(start_dim=1)
+                .sum(dim=1)
+                / denominator
+            )
+            sparsity_loss = torch.abs(predicted_sparsity - true_sparsity) + (1 - recall)
+            sparsity_loss = (
+                sparsity_loss *
+                supervised_examples.to(sparsity_loss.dtype)
+            ).sum() / supervised_count.clamp_min(1.0)
             loss = sparsity_loss
 
         return loss, {
@@ -1505,7 +1507,7 @@ def main() -> None:
         # With validation data, keep the checkpoint with the lowest validation
         # loss and also save "last" for resuming/debugging.
         checkpoint_callback = ModelCheckpoint(
-            dirpath=args.output_dir / "checkpoints",
+            dirpath=args.output_dir / args.output_subdir / "checkpoints",
             filename=f"{args.model}" + "-{epoch:02d}-{val_loss:.4f}",
             monitor="val_loss",
             mode="min",
@@ -1516,18 +1518,18 @@ def main() -> None:
         # Without validation data, there is no model-selection metric. Save all
         # epoch checkpoints plus "last" so training output is still recoverable.
         checkpoint_callback = ModelCheckpoint(
-            dirpath=args.output_dir / "checkpoints",
+            dirpath=args.output_dir / args.output_subdir / "checkpoints",
             filename=f"{args.model}" + "-{epoch:02d}",
             save_top_k=-1,
             save_last=True,
         )
 
-    csv_logger = CSVLogger(save_dir=args.output_dir, name="metrics")
+    csv_logger = CSVLogger(save_dir=args.output_dir / args.output_subdir, name="metrics")
     trainer = pl.Trainer(
         max_epochs=args.max_epochs,
         accelerator=args.accelerator,
         devices=int(args.devices) if args.devices.isdigit() else args.devices,
-        default_root_dir=args.output_dir,
+        default_root_dir=args.output_dir / args.output_subdir,
         callbacks=[checkpoint_callback],
         logger=csv_logger,
         log_every_n_steps=args.log_every_n_steps,

@@ -23,9 +23,10 @@ fi
 
 argument="$1"
 
-python ../execute_pipeline.py \
+cd /nfs/home/students/a.spannagl/master_repository
+python -m scripts.training_pipeline.execute_pipeline \
   --model dscript \
-  --interactions /nfs/scratch/pdb_dimers/balanced_interactions_strict_cd_hit.tsv \
+  --interactions /nfs/scratch/pdb_dimers/final_datasets/balanced_interactions_strict_cd_hit.tsv \
   --interaction-loss-lambda 0.5 \
   --contact-threshold 0.5 \
   --batch-size 8 \
