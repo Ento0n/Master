@@ -24,7 +24,7 @@ parameters:
     values: [normal, max]
   
   max-epochs:
-    value: 30
+    value: 99
   
 command:
   - ${env}

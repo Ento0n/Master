@@ -20,7 +20,7 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset
 
 import lightning.pytorch as pl
-from lightning.pytorch.callbacks import ModelCheckpoint
+from lightning.pytorch.callbacks import ModelCheckpoint, EarlyStopping
 from lightning.pytorch.loggers import CSVLogger, WandbLogger
 
 from scripts.models import DScriptInteractionModel, FullyConnectedInteractionModel
@@ -1150,7 +1150,7 @@ class DScriptLightningModule(pl.LightningModule):
             "optimizer": optimizer,
             "lr_scheduler": {
                 "scheduler": scheduler,
-                "monitor": "val_interaction_loss",
+                "monitor": "val_loss",
                 "interval": "epoch",
                 "frequency": 1,
             },
@@ -1561,7 +1561,7 @@ def main() -> None:
         checkpoint_callback = ModelCheckpoint(
             dirpath=args.output_dir / args.output_subdir / "checkpoints",
             filename=f"{args.model}" + "-{epoch:02d}-{val_loss:.4f}",
-            monitor="val_interaction_loss",
+            monitor="val_loss",
             mode="min",
             save_top_k=1,
             save_last=True,
@@ -1575,6 +1575,14 @@ def main() -> None:
             save_top_k=-1,
             save_last=True,
         )
+    
+    early_stopping = EarlyStopping(
+        monitor="val_loss",
+        mode="min",
+        patience=5,
+        min_delta=0.01,
+        verbose=True
+    )
 
     csv_logger = CSVLogger(save_dir=args.output_dir / args.output_subdir, name="metrics")
     wandb_logger = WandbLogger(project="master", log_model=False)
@@ -1583,7 +1591,7 @@ def main() -> None:
         accelerator=args.accelerator,
         devices=int(args.devices) if args.devices.isdigit() else args.devices,
         default_root_dir=args.output_dir / args.output_subdir,
-        callbacks=[checkpoint_callback],
+        callbacks=[checkpoint_callback, early_stopping],
         logger=[csv_logger, wandb_logger],
         log_every_n_steps=args.log_every_n_steps,
     )
