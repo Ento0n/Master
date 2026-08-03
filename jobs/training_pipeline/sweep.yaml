@@ -5,7 +5,7 @@ project: master
 method: bayes
 
 metric:
-  name: val_interaction_loss
+  name: best_val_loss
   goal: minimize
 
 parameters:
@@ -13,23 +13,34 @@ parameters:
     value: dscript
 
   interaction-loss-lambda:
-    distribution: log_uniform_values
-    min: 0.5
-    max: 0.95
+    value: 0.5
   
   loss-type:
-    values: [contact, sparsity_11, sparsity_12, sparsity_21, sparsity_22]
+    value: sparsity_21
   
   int-mod-type:
-    values: [normal, max]
+    value: normal
+  
+  max-pooling:
+    values: [true, false]
+  
+  negative-contact-maps:
+    values: [true, false]
+
+  trainable-final-slope:
+    values: [true, false]
+
+  gamma-init:
+    distribution: uniform
+    min: 0.0
+    max: 5.0
   
   max-epochs:
-    value: 99
+    value: 98
   
 command:
   - ${env}
   - ${interpreter}
   - "-m"
   - scripts.training_pipeline.execute_pipeline
-  - ${args}
-  
+  - ${args_no_boolean_flags}

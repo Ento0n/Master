@@ -27,7 +27,7 @@ cd /nfs/home/students/a.spannagl/master_repository
 python -m scripts.training_pipeline.execute_pipeline \
   --model dscript \
   --interaction-loss-lambda 0.5 \
-  --max-epochs 10 \
+  --max-epochs 89 \
   "${output_subdir_args[@]}" \
-  --loss-type sparsity_11 \
-  --int-mod-type normal
+  --loss-type sparsity_21 \
+  --int-mod-type max \

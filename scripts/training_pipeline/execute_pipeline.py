@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 from pathlib import Path
+from functools import partial
 
 import time
 
@@ -49,6 +50,8 @@ DEFAULT_EMBEDDING_MANIFEST = Path("/nfs/scratch/pdb_dimers/embeddings/esm2_t33_6
 DEFAULT_CONTACT_MAP_DIR = Path("/nfs/scratch/pdb_dimers/contact_maps/data")
 DEFAULT_OUTPUT_DIR = Path("/nfs/home/students/a.spannagl/master_repository/jobs/training_pipeline/results")
 CONTACT_MAP_SAMPLE_COUNT = 5
+
+MONITOR = "val_loss"
 
 
 def parse_args() -> argparse.Namespace:
@@ -144,6 +147,14 @@ def parse_args() -> argparse.Namespace:
         choices=("contact", "sparsity_11", "sparsity_12", "sparsity_21", "sparsity_22"), 
         help="Which loss type to apply for the contact map, choices: contact, sparsity")
     parser.add_argument("--int-mod-type", default="normal", type=str, choices=("normal", "max"), help="Which loss type to apply for the contact map, choices: normal, max")
+    parser.add_argument("--trainable-final-slope", action="store_true", help="DScript Interaction module slope applied.")
+    parser.add_argument("--gamma-init", type=float, default=0.0, help="DScript gamma parameter of interaction module, (gamma*variance)-mean as threshold of high contacts.")
+    parser.add_argument(
+        "--negative-contact-maps",
+        action="store_true",
+        help="Use zero contact targets for negative examples instead of unknown (-1).",
+    )
+    parser.add_argument("--max-pooling", action="store_true", help="Using max pooling for normal interaction head.")
     return parser.parse_args()
 
 
@@ -278,12 +289,19 @@ def save_loss_plot(metrics_path: Path, output_path: Path) -> None:
     # Lightning writes one sparse CSV row per logged metric. Grouping by epoch
     # reconstructs the train/validation loss curves that were logged with
     # on_epoch=True. If no validation split exists, the plot contains only train.
-    loss_series: dict[str, pd.Series] = {}
-    for metric_name, display_name in (
-        ("train_loss", "Train loss"), ("val_loss", "Validation loss"), 
-        ("train_interaction_loss", "Train Interaction Loss"), ("val_interaction_loss", "Validation Interaction Loss"), 
-        ("train_contact_loss", "Train Contact Loss"), ("val_contact_loss", "Validation Contact Loss")
-        ):
+    # Each objective has its own hue, while train/validation use dark/light
+    # shades of that hue. The generic loss is the weighted combination of the
+    # interaction and contact objectives, so it is labelled "Both".
+    loss_metrics = (
+        ("train_loss", "Train Both Loss", "#6A3D9A"),
+        ("val_loss", "Validation Both Loss", "#CAB2D6"),
+        ("train_interaction_loss", "Train Interaction Loss", "#D95F02"),
+        ("val_interaction_loss", "Validation Interaction Loss", "#FDAE6B"),
+        ("train_contact_loss", "Train Contact Loss", "#1B7837"),
+        ("val_contact_loss", "Validation Contact Loss", "#7FBF7B"),
+    )
+    loss_series: dict[str, tuple[pd.Series, str]] = {}
+    for metric_name, display_name, color in loss_metrics:
         if metric_name not in metrics.columns:
             continue
 
@@ -292,7 +310,8 @@ def save_loss_plot(metrics_path: Path, output_path: Path) -> None:
             continue
 
         metric_rows["epoch"] = metric_rows["epoch"].astype(int)
-        loss_series[display_name] = metric_rows.groupby("epoch")[metric_name].last().sort_index()
+        values = metric_rows.groupby("epoch")[metric_name].last().sort_index()
+        loss_series[display_name] = (values, color)
 
     if not loss_series:
         print(f"Skipping loss plot because no train_loss or val_loss rows were found in {metrics_path}")
@@ -300,10 +319,10 @@ def save_loss_plot(metrics_path: Path, output_path: Path) -> None:
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     plt.figure(figsize=(8, 5))
-    for display_name, values in loss_series.items():
+    for display_name, (values, color) in loss_series.items():
         # Epochs are shown as 1-based labels because the saved checkpoints and
         # console progress are easier to compare to human-readable epoch counts.
-        plt.plot(values.index + 1, values.values, marker="o", label=display_name)
+        plt.plot(values.index + 1, values.values, color=color, marker="o", label=display_name)
 
     plt.xlabel("Epoch")
     plt.ylabel("Loss")
@@ -601,7 +620,7 @@ class DScriptDataset(Dataset):
         return torch.as_tensor(contact_map.astype(np.float32, copy=False))
 
 
-def collate_dscript_batch(items: list[dict[str, object]]) -> dict[str, torch.Tensor]:
+def collate_dscript_batch(items: list[dict[str, object]], negative_contact_maps: bool) -> dict[str, torch.Tensor]:
     """Pad variable-length embeddings and contact maps within one D-SCRIPT batch."""
     batch_size = len(items)
     embedding_dim = items[0]["embedding_1"].shape[1]
@@ -656,6 +675,10 @@ def collate_dscript_batch(items: list[dict[str, object]]) -> dict[str, torch.Ten
             # interaction objective for those examples.
             interaction_pair_masks[batch_index, :residues_1, :residues_2] = True
 
+            # if wanted, contact maps for negatives are matrices with 0s
+            if negative_contact_maps:
+                contact_maps[batch_index, :residues_1, :residues_2] = 0.0
+
     return {
         "embedding_1": embeddings_1,
         "embedding_2": embeddings_2,
@@ -681,6 +704,7 @@ class DScriptDataModule(pl.LightningDataModule):
         num_workers: int,
         loss_mode: str,
         limit_rows: int | None,
+        negative_contact_maps: bool,
     ) -> None:
         super().__init__()
         self.interaction_path = interaction_path
@@ -690,6 +714,11 @@ class DScriptDataModule(pl.LightningDataModule):
         self.num_workers = num_workers
         self.loss_mode = loss_mode
         self.limit_rows = limit_rows
+
+        self.collate_fn = partial(
+            collate_dscript_batch,
+            negative_contact_maps=negative_contact_maps,
+        )
 
         self.train_dataset: DScriptDataset | None = None
         self.val_dataset: DScriptDataset | None = None
@@ -788,7 +817,7 @@ class DScriptDataModule(pl.LightningDataModule):
             batch_size=self.batch_size,
             shuffle=True,
             num_workers=self.num_workers,
-            collate_fn=collate_dscript_batch,
+            collate_fn=self.collate_fn,
         )
 
     def val_dataloader(self) -> DataLoader | None:
@@ -800,7 +829,7 @@ class DScriptDataModule(pl.LightningDataModule):
             batch_size=self.batch_size,
             shuffle=False,
             num_workers=self.num_workers,
-            collate_fn=collate_dscript_batch,
+            collate_fn=self.collate_fn,
         )
 
     def test_dataloader(self) -> DataLoader | None:
@@ -812,7 +841,7 @@ class DScriptDataModule(pl.LightningDataModule):
             batch_size=self.batch_size,
             shuffle=False,
             num_workers=self.num_workers,
-            collate_fn=collate_dscript_batch,
+            collate_fn=self.collate_fn,
         )
 
 
@@ -831,6 +860,9 @@ class DScriptLightningModule(pl.LightningModule):
         contact_threshold: float,
         loss_type: str,
         interaction_module_type: str,
+        trainable_final_slope: bool,
+        gamma_init: float,
+        max_pooling: float,
     ) -> None:
         super().__init__()
         self.save_hyperparameters()
@@ -840,7 +872,10 @@ class DScriptLightningModule(pl.LightningModule):
             contact_hidden_dim=contact_hidden_dim,
             contact_width=contact_width,
             projection_dropout=projection_dropout,
-            interaction_module_type=interaction_module_type
+            interaction_module_type=interaction_module_type,
+            trainable_final_slope=trainable_final_slope,
+            gamma_init=gamma_init,
+            max_pooling=max_pooling,
         )
         self.learning_rate = learning_rate
         self.interaction_loss_lambda = interaction_loss_lambda
@@ -1150,11 +1185,26 @@ class DScriptLightningModule(pl.LightningModule):
             "optimizer": optimizer,
             "lr_scheduler": {
                 "scheduler": scheduler,
-                "monitor": "val_loss",
+                "monitor": MONITOR,
                 "interval": "epoch",
                 "frequency": 1,
             },
         }
+
+    def optimizer_step(
+        self,
+        epoch: int,
+        batch_idx: int,
+        optimizer: torch.optim.Optimizer,
+        optimizer_closure: object | None = None,
+    ) -> None:
+        """Take one optimizer step, then project constrained D-SCRIPT parameters."""
+        # Lightning's optimizer closure performs forward, zero_grad, and
+        # backward. Constraints must be applied only after that closure and the
+        # parameter update finish; changing a parameter between forward and
+        # backward invalidates autograd's saved parameter versions.
+        super().optimizer_step(epoch, batch_idx, optimizer, optimizer_closure)
+        self.model.clip_parameters()
 
 
 # =============================================================================
@@ -1199,6 +1249,7 @@ def build_data_module_and_model(
         num_workers=args.num_workers,
         loss_mode=loss_mode,
         limit_rows=args.limit_rows,
+        negative_contact_maps=args.negative_contact_maps,
     )
     model = DScriptLightningModule(
         embedding_dim=args.embedding_dim,
@@ -1210,7 +1261,10 @@ def build_data_module_and_model(
         interaction_loss_lambda=args.interaction_loss_lambda,
         contact_threshold=args.contact_threshold,
         loss_type=args.loss_type,
-        interaction_module_type=args.int_mod_type
+        interaction_module_type=args.int_mod_type,
+        trainable_final_slope=args.trainable_final_slope,
+        gamma_init=args.gamma_init,
+        max_pooling=args.max_pooling,
     )
     return data_module, model
 
@@ -1251,7 +1305,7 @@ def make_prediction_dataloader(
     # used during training pads embeddings/maps and creates masks, so prediction
     # sees the exact tensor shapes and padding semantics used for evaluation.
     if isinstance(dataset, DScriptDataset):
-        kwargs["collate_fn"] = collate_dscript_batch
+        kwargs["collate_fn"] = data_module.collate_fn
 
     return DataLoader(dataset, **kwargs)
 
@@ -1477,7 +1531,7 @@ def save_test_contact_map_samples(
     device = next(model.parameters()).device
     for sample_number, test_index in enumerate(sampled_indices, start=1):
         item = test_dataset[int(test_index)]
-        batch = collate_dscript_batch([item])
+        batch = data_module.collate_fn([item])
         batch = move_tensor_batch_to_device(batch, device)
 
         with torch.inference_mode():
@@ -1526,12 +1580,18 @@ def main() -> None:
     # values and the decimal point in lambda are removed; underscores between
     # values make the four settings readable, e.g. normal_sparsity11_095_30.
     if args.output_subdir is None:
-        interaction_loss_lambda = str(args.interaction_loss_lambda).replace(".", "")
+        gamma = "g" + str(args.gamma_init).replace(".", "")
+        trainable_final_slope = "yestf" if args.trainable_final_slope else "notf"
+        max_pooling = "yesmax" if args.max_pooling else "nomax"
+        negative_maps = "yesnm" if args.negative_contact_maps else "nonm"
         args.output_subdir = "_".join(
             (
                 args.int_mod_type.replace("_", ""),
                 args.loss_type.replace("_", ""),
-                interaction_loss_lambda,
+                negative_maps,
+                max_pooling,
+                trainable_final_slope,
+                gamma,
                 str(args.max_epochs),
             )
         )
@@ -1561,7 +1621,7 @@ def main() -> None:
         checkpoint_callback = ModelCheckpoint(
             dirpath=args.output_dir / args.output_subdir / "checkpoints",
             filename=f"{args.model}" + "-{epoch:02d}-{val_loss:.4f}",
-            monitor="val_loss",
+            monitor=MONITOR,
             mode="min",
             save_top_k=1,
             save_last=True,
@@ -1577,7 +1637,7 @@ def main() -> None:
         )
     
     early_stopping = EarlyStopping(
-        monitor="val_loss",
+        monitor=MONITOR,
         mode="min",
         patience=5,
         min_delta=0.01,
@@ -1597,6 +1657,15 @@ def main() -> None:
     )
 
     trainer.fit(model, datamodule=data_module)
+
+    # log best score to be able to look at best instead of last in WandB
+    best_score = checkpoint_callback.best_model_score.detach().cpu().item()
+
+    wandb_logger.log_metrics(
+        {"best_" + MONITOR: best_score},
+        step=trainer.global_step,
+    )
+
 
     if data_module.test_dataset and len(data_module.test_dataset) > 0:
         # If validation existed, test the best validation checkpoint. Otherwise

@@ -149,7 +149,9 @@ class DScriptInteractionModel(nn.Module):
         final_midpoint: float = 0.5,
         final_slope: float = 20.0,
         trainable_final_slope: bool = False,
-        interaction_module_type: str = "normal"
+        interaction_module_type: str = "normal",
+        gamma_init: float = 0.0,
+        max_pooling: bool = True,
     ) -> None:
         super().__init__()
         # The model has three conceptual parts:
@@ -170,16 +172,25 @@ class DScriptInteractionModel(nn.Module):
 
         # This activation converts the pooled contact evidence into a final
         # interaction logit/probability.
+        self.local_pool = nn.MaxPool2d(
+            kernel_size=9,
+            padding=4,
+        )
         self.final_activation = LogisticActivation(final_midpoint, final_slope, trainable_final_slope)
-        self.clip_parameters()
 
         self.interaction_module_type = interaction_module_type
+        self.gamma = nn.Parameter(torch.tensor(float(gamma_init)))
+        self.max_pooling = max_pooling
+
+        self.clip_parameters()
+
 
     def clip_parameters(self) -> None:
         """Clamp constrained parameters to the ranges used by D-SCRIPT."""
         self.contact_module.clip_parameters()
         self.final_activation.clip_parameters()
         with torch.no_grad():
+            self.gamma.clamp_(min=0.0)
             if self.use_weight_matrix:
                 self.theta.clamp_(min=0.0, max=1.0)
                 self.lambda_.clamp_(min=0.0)
@@ -287,7 +298,66 @@ class DScriptInteractionModel(nn.Module):
         # tensor detached from autograd, so BCE cannot propagate gradients back
         # into the contact and projection layers.
         if self.interaction_module_type == "normal":
-            logits = self._interaction_logits(contacts, pooling_mask)
+            if not self.max_pooling:
+                logits = self._interaction_logits(contacts, pooling_mask)
+            else:
+                # contacts:     [B, max_len_1, max_len_2]
+                # pair_mask:    [B, max_len_1, max_len_2]
+                # pooling_mask: [B, max_len_1, max_len_2]
+
+                # True for every non-padded residue in protein 1.
+                residue_mask_1 = pair_mask.any(dim=2)
+                # shape: [B, max_len_1]
+
+                # Number of real residues in protein 1 for every batch example.
+                lengths_1 = residue_mask_1.sum(dim=1)
+                # shape: [B]
+
+                # True for every non-padded residue in protein 2.
+                residue_mask_2 = pair_mask.any(dim=1)
+                # shape: [B, max_len_2]
+
+                # Number of real residues in protein 2 for every batch example.
+                lengths_2 = residue_mask_2.sum(dim=1)
+                # shape: [B]
+
+                # Convert the lengths to Python lists for tensor slicing.
+                # Each list contains B integers.
+                lengths_1 = lengths_1.detach().cpu().tolist()
+                lengths_2 = lengths_2.detach().cpu().tolist()
+
+                per_example_logits = []
+
+                for batch_index, (residues_1, residues_2) in enumerate(
+                    zip(lengths_1, lengths_2)
+                ):
+                    # Remove batch padding from this example.
+                    sample_contacts = contacts[
+                        batch_index : batch_index + 1,
+                        :residues_1,
+                        :residues_2,
+                    ]
+                    # shape: [1, residues_1, residues_2]
+
+                    sample_pooling_mask = pooling_mask[
+                        batch_index : batch_index + 1,
+                        :residues_1,
+                        :residues_2,
+                    ]
+                    # shape: [1, residues_1, residues_2]
+
+                    # This is the existing function. It does not need to be replaced.
+                    sample_logit = self._interaction_logits(
+                        sample_contacts,
+                        sample_pooling_mask,
+                    )
+                    # shape: [1]
+
+                    per_example_logits.append(sample_logit)
+
+                # List containing B tensors, each shaped [1], becomes one batch tensor.
+                logits = torch.cat(per_example_logits, dim=0)
+                # shape: [B]
         else:
             logits = self._any_contact_interaction_logits(contact_logits, pooling_mask)
 
@@ -324,6 +394,18 @@ class DScriptInteractionModel(nn.Module):
             # The positional weight matrix has shape [residues_1, residues_2].
             # It is unsqueezed so the same matrix broadcasts across the batch.
             scores = scores * self._weight_matrix(contacts).unsqueeze(0)
+
+        if self.max_pooling:
+            # Invalid cells must not win a max-pooling window.
+            scores = scores.masked_fill(~pair_mask, -torch.inf)
+
+            scores = self.local_pool(scores.unsqueeze(1)).squeeze(1)
+            pair_mask = (
+                self.local_pool(pair_mask.to(scores.dtype).unsqueeze(1))
+                .squeeze(1)
+                .bool()
+            )
+
         scores = scores.masked_fill(~pair_mask, 0.0)
 
         # D-SCRIPT does not average all contacts directly. It first computes the
@@ -336,7 +418,19 @@ class DScriptInteractionModel(nn.Module):
         # ``high_contacts`` keeps only contact evidence above the per-example
         # mean. The +1 in the denominator is the same stabilizing convention used
         # by D-SCRIPT to avoid division by zero when no score exceeds the mean.
-        high_contacts = torch.relu(scores - mean[:, None, None]) * valid
+        centered = (scores - mean[:, None, None]) * valid
+        variance = (
+            centered.square().sum(dim=(1,2))
+            / (valid_count - 1.0).clamp_min(1.0)
+        )
+
+        gamma = self.gamma.clamp_min(0.0)
+        threshold = mean + gamma * variance
+
+        high_contacts = torch.relu(
+            scores - threshold[:, None, None]
+        ) * valid
+
         high_contact_count = (high_contacts > 0).to(dtype=scores.dtype).sum(dim=(1, 2))
         raw_probability = high_contacts.sum(dim=(1, 2)) / (high_contact_count + 1.0)
         return self.final_activation.logits(raw_probability)
