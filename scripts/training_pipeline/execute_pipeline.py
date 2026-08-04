@@ -24,7 +24,7 @@ import lightning.pytorch as pl
 from lightning.pytorch.callbacks import ModelCheckpoint, EarlyStopping
 from lightning.pytorch.loggers import CSVLogger, WandbLogger
 
-from scripts.models import DScriptInteractionModel, FullyConnectedInteractionModel
+from scripts.models import DScriptInteractionModel, FullyConnectedInteractionModel, QueryPatchInteractionModel
 
 
 # =============================================================================
@@ -59,7 +59,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Train a PDB dimer interaction model.")
     parser.add_argument(
         "--model",
-        choices=("dscript", "fully_connected"),
+        choices=("dscript", "query_patch", "fully_connected"),
         help="Model family to train.",
     )
     parser.add_argument(
@@ -113,6 +113,36 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--contact-hidden-dim", type=int, default=50, help="D-SCRIPT contact module hidden channels.")
     parser.add_argument("--contact-width", type=int, default=7, help="Odd convolution width for contact prediction.")
     parser.add_argument("--projection-dropout", type=float, default=0.5, help="D-SCRIPT projection dropout.")
+    parser.add_argument(
+        "--num-interaction-queries",
+        type=int,
+        default=32,
+        help="Number of learned interface-patch queries for the query_patch model.",
+    )
+    parser.add_argument(
+        "--query-heads",
+        type=int,
+        default=4,
+        help="Attention heads in each query_patch decoder layer.",
+    )
+    parser.add_argument(
+        "--query-layers",
+        type=int,
+        default=1,
+        help="Transformer decoder layers in the query_patch contact module.",
+    )
+    parser.add_argument(
+        "--query-dropout",
+        type=float,
+        default=0.1,
+        help="Dropout inside the query_patch transformer decoder.",
+    )
+    parser.add_argument(
+        "--query-contact-bias-init",
+        type=float,
+        default=-6.0,
+        help="Initial background contact logit for the sparse query_patch map.",
+    )
     parser.add_argument(
         "--interaction-loss-lambda",
         type=float,
@@ -175,6 +205,19 @@ def validate_args(args: argparse.Namespace) -> None:
     # keeps each output cell centered on the same residue pair.
     if args.contact_width <= 0 or args.contact_width % 2 == 0:
         raise ValueError("--contact-width must be a positive odd integer")
+
+    # Query-patch attention operates in the projected residue dimension. Multi-
+    # head attention splits that dimension evenly across heads, and at least one
+    # learned query/decoder layer is required to construct contact patches.
+    if args.model == "query_patch":
+        if args.num_interaction_queries <= 0:
+            raise ValueError("--num-interaction-queries must be positive")
+        if args.query_heads <= 0 or args.projection_dim % args.query_heads != 0:
+            raise ValueError("--query-heads must be positive and divide --projection-dim")
+        if args.query_layers <= 0:
+            raise ValueError("--query-layers must be positive")
+        if not 0.0 <= args.query_dropout < 1.0:
+            raise ValueError("--query-dropout must be in [0, 1)")
 
 
 def split_pair(value: object, column_name: str) -> tuple[str, str]:
@@ -827,7 +870,7 @@ class DScriptDataModule(pl.LightningDataModule):
         return DataLoader(
             self.val_dataset,
             batch_size=self.batch_size,
-            shuffle=False,
+            shuffle=True,
             num_workers=self.num_workers,
             collate_fn=self.collate_fn,
         )
@@ -1208,6 +1251,74 @@ class DScriptLightningModule(pl.LightningModule):
 
 
 # =============================================================================
+# Query-patch model wrapper
+# =============================================================================
+
+
+class QueryPatchLightningModule(DScriptLightningModule):
+    """Reuse the established losses and metrics with the query-patch model.
+
+    The parent Lightning module remains the unchanged D-SCRIPT baseline. This
+    subclass replaces only its inner model, keeping all experimental query
+    configuration outside the baseline implementation and checkpoint API.
+    """
+
+    def __init__(
+        self,
+        embedding_dim: int,
+        projection_dim: int,
+        contact_hidden_dim: int,
+        contact_width: int,
+        projection_dropout: float,
+        learning_rate: float,
+        interaction_loss_lambda: float,
+        contact_threshold: float,
+        loss_type: str,
+        interaction_module_type: str,
+        trainable_final_slope: bool,
+        gamma_init: float,
+        max_pooling: float,
+        num_interaction_queries: int = 32,
+        query_heads: int = 4,
+        query_layers: int = 1,
+        query_dropout: float = 0.1,
+        query_contact_bias_init: float = -6.0,
+    ) -> None:
+        super().__init__(
+            embedding_dim=embedding_dim,
+            projection_dim=projection_dim,
+            contact_hidden_dim=contact_hidden_dim,
+            contact_width=contact_width,
+            projection_dropout=projection_dropout,
+            learning_rate=learning_rate,
+            interaction_loss_lambda=interaction_loss_lambda,
+            contact_threshold=contact_threshold,
+            loss_type=loss_type,
+            interaction_module_type=interaction_module_type,
+            trainable_final_slope=trainable_final_slope,
+            gamma_init=gamma_init,
+            max_pooling=max_pooling,
+        )
+        self.save_hyperparameters()
+        self.model = QueryPatchInteractionModel(
+            embedding_dim=embedding_dim,
+            projection_dim=projection_dim,
+            contact_hidden_dim=contact_hidden_dim,
+            contact_width=contact_width,
+            projection_dropout=projection_dropout,
+            interaction_module_type=interaction_module_type,
+            trainable_final_slope=trainable_final_slope,
+            gamma_init=gamma_init,
+            max_pooling=max_pooling,
+            num_queries=num_interaction_queries,
+            query_heads=query_heads,
+            query_layers=query_layers,
+            query_dropout=query_dropout,
+            contact_bias_init=query_contact_bias_init,
+        )
+
+
+# =============================================================================
 # Training orchestration and model selection
 # =============================================================================
 
@@ -1251,7 +1362,7 @@ def build_data_module_and_model(
         limit_rows=args.limit_rows,
         negative_contact_maps=args.negative_contact_maps,
     )
-    model = DScriptLightningModule(
+    model_options = dict(
         embedding_dim=args.embedding_dim,
         projection_dim=args.projection_dim,
         contact_hidden_dim=args.contact_hidden_dim,
@@ -1266,6 +1377,17 @@ def build_data_module_and_model(
         gamma_init=args.gamma_init,
         max_pooling=args.max_pooling,
     )
+    if args.model == "query_patch":
+        model = QueryPatchLightningModule(
+            **model_options,
+            num_interaction_queries=args.num_interaction_queries,
+            query_heads=args.query_heads,
+            query_layers=args.query_layers,
+            query_dropout=args.query_dropout,
+            query_contact_bias_init=args.query_contact_bias_init,
+        )
+    else:
+        model = DScriptLightningModule(**model_options)
     return data_module, model
 
 
@@ -1505,7 +1627,7 @@ def save_test_contact_map_samples(
 ) -> None:
     """Save predicted and true contact maps for random test examples with labels."""
     if not isinstance(data_module.test_dataset, DScriptDataset) or not isinstance(model, DScriptLightningModule):
-        print("Skipping contact-map PNG export because contact maps are only available for the D-SCRIPT model")
+        print("Skipping contact-map PNG export because this model does not produce residue contact maps")
         return
 
     test_dataset = data_module.test_dataset
@@ -1576,25 +1698,30 @@ def main() -> None:
     validate_args(args)
 
     # Build a compact, reproducible directory name for sweep runs while still
-    # allowing callers to provide a custom --output-subdir. Underscores inside
-    # values and the decimal point in lambda are removed; underscores between
-    # values make the four settings readable, e.g. normal_sparsity11_095_30.
+    # allowing callers to provide a custom --output-subdir. Existing D-SCRIPT
+    # names remain unchanged; query-patch runs receive an architecture prefix so
+    # they cannot overwrite a baseline run with otherwise identical settings.
     if args.output_subdir is None:
         gamma = "g" + str(args.gamma_init).replace(".", "")
         trainable_final_slope = "yestf" if args.trainable_final_slope else "notf"
         max_pooling = "yesmax" if args.max_pooling else "nomax"
         negative_maps = "yesnm" if args.negative_contact_maps else "nonm"
-        args.output_subdir = "_".join(
-            (
-                args.int_mod_type.replace("_", ""),
-                args.loss_type.replace("_", ""),
-                negative_maps,
-                max_pooling,
-                trainable_final_slope,
-                gamma,
-                str(args.max_epochs),
-            )
+        output_name_parts = (
+            args.int_mod_type.replace("_", ""),
+            args.loss_type.replace("_", ""),
+            negative_maps,
+            max_pooling,
+            trainable_final_slope,
+            gamma,
+            str(args.max_epochs),
         )
+        if args.model == "query_patch":
+            query_architecture = (
+                f"querypatch-q{args.num_interaction_queries}"
+                f"-h{args.query_heads}-l{args.query_layers}"
+            )
+            output_name_parts = (query_architecture, *output_name_parts)
+        args.output_subdir = "_".join(output_name_parts)
 
     # Set pytorch lightning seed & set up tensor cores
     pl.seed_everything(42)

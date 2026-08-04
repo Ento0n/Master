@@ -2,5 +2,6 @@
 
 from .dscript import DScriptInteractionModel
 from .fully_connected import FullyConnectedInteractionModel
+from .query_patch import QueryPatchInteractionModel
 
-__all__ = ["DScriptInteractionModel", "FullyConnectedInteractionModel"]
+__all__ = ["DScriptInteractionModel", "FullyConnectedInteractionModel", "QueryPatchInteractionModel"]
