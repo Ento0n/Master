@@ -185,6 +185,8 @@ def parse_args() -> argparse.Namespace:
         help="Use zero contact targets for negative examples instead of unknown (-1).",
     )
     parser.add_argument("--max-pooling", action="store_true", help="Using max pooling for normal interaction head.")
+    parser.add_argument("--compatibility-rank", type=int, default=32, help="The dimension in which the compatibility for the query patch model is executed.")
+    parser.add_argument("--compatibility-scale-init", type=float, default=0.05, help="The scale in which the compatibility is applied to the contact logits.")
     return parser.parse_args()
 
 
@@ -1283,6 +1285,8 @@ class QueryPatchLightningModule(DScriptLightningModule):
         query_layers: int = 1,
         query_dropout: float = 0.1,
         query_contact_bias_init: float = -6.0,
+        compatibility_rank: int = 32,
+        compatibility_scale_init: float = 0.05,
     ) -> None:
         super().__init__(
             embedding_dim=embedding_dim,
@@ -1315,6 +1319,8 @@ class QueryPatchLightningModule(DScriptLightningModule):
             query_layers=query_layers,
             query_dropout=query_dropout,
             contact_bias_init=query_contact_bias_init,
+            compatibility_rank=compatibility_rank,
+            compatibility_scale_init=compatibility_scale_init,
         )
 
 
@@ -1385,6 +1391,8 @@ def build_data_module_and_model(
             query_layers=args.query_layers,
             query_dropout=args.query_dropout,
             query_contact_bias_init=args.query_contact_bias_init,
+            compatibility_rank=args.compatibility_rank,
+            compatibility_scale_init=args.compatibility_scale_init,
         )
     else:
         model = DScriptLightningModule(**model_options)
@@ -1702,17 +1710,12 @@ def main() -> None:
     # names remain unchanged; query-patch runs receive an architecture prefix so
     # they cannot overwrite a baseline run with otherwise identical settings.
     if args.output_subdir is None:
-        gamma = "g" + str(args.gamma_init).replace(".", "")
-        trainable_final_slope = "yestf" if args.trainable_final_slope else "notf"
-        max_pooling = "yesmax" if args.max_pooling else "nomax"
-        negative_maps = "yesnm" if args.negative_contact_maps else "nonm"
+        scale = "g" + str(args.compatibility_scale_init).replace(".", "")
         output_name_parts = (
             args.int_mod_type.replace("_", ""),
-            args.loss_type.replace("_", ""),
-            negative_maps,
-            max_pooling,
-            trainable_final_slope,
-            gamma,
+            "compatibility",
+            str(args.compatibility_rank),
+            scale,
             str(args.max_epochs),
         )
         if args.model == "query_patch":

@@ -43,6 +43,8 @@ class QueryPatchContactModule(nn.Module):
         num_layers: int = 1,
         dropout: float = 0.1,
         contact_bias_init: float = -6.0,
+        compatibility_rank: int = 32,
+        compatibility_scale_init: float = 0.05,
     ) -> None:
         super().__init__()
         if projection_dim <= 0:
@@ -103,6 +105,25 @@ class QueryPatchContactModule(nn.Module):
         self.patch_strength = nn.Linear(projection_dim, 1)
         nn.init.constant_(self.patch_strength.bias, -2.0)
         self.contact_bias = nn.Parameter(torch.tensor(float(contact_bias_init)))
+
+        # compatibility: allowing the model to learn interface connections
+        self.compatibility_rank = compatibility_rank
+
+        self.compatibility_norm = nn.LayerNorm(projection_dim)
+        self.compatibility_projection = nn.Linear(
+            projection_dim,
+            compatibility_rank,
+            bias=False,
+        )
+
+        # metric gives compatibility for residue pairs by going over projected ranks
+        metric = torch.ones(compatibility_rank)
+        metric[1::2] = -1.0
+        self.compatibility_metric = nn.Parameter(metric)
+
+        self.compatibility_scale = nn.Parameter(
+            torch.tensor(float(compatibility_scale_init))
+        )
 
     def forward(
         self,
@@ -170,6 +191,7 @@ class QueryPatchContactModule(nn.Module):
         scale = math.sqrt(self.projection_dim)
         mask_logits_1 = torch.bmm(query_features, residue_features_1.transpose(1, 2)) / scale
         mask_logits_2 = torch.bmm(query_features, residue_features_2.transpose(1, 2)) / scale
+        # shape: [B, K, L]
 
         patch_masks_1 = torch.sigmoid(mask_logits_1).masked_fill(~mask_1[:, None, :], 0.0)
         patch_masks_2 = torch.sigmoid(mask_logits_2).masked_fill(~mask_2[:, None, :], 0.0)
@@ -179,8 +201,43 @@ class QueryPatchContactModule(nn.Module):
         # [B,L1,L2] tensor. Scaling keeps initial logit magnitudes comparable
         # when num_queries changes; contact_bias supplies the sparse background.
         weighted_masks_1 = patch_masks_1 * patch_strengths[:, :, None]
-        contact_logits = torch.bmm(weighted_masks_1.transpose(1, 2), patch_masks_2)
-        contact_logits = contact_logits / math.sqrt(self.num_queries) + self.contact_bias
+        query_evidence = torch.bmm(weighted_masks_1.transpose(1, 2), patch_masks_2)
+        query_evidence = query_evidence / math.sqrt(self.num_queries)
+        # Function: A^T * diag(strength) * B / sqrt(K)
+
+        pair_mask = mask_1[:, :, None] & mask_2[:, None, :]
+
+        query_evidence = query_evidence.masked_fill(~pair_mask, 0.0)
+
+        ### Signed pairwise residue compatibility
+        normalized_1 = self.compatibility_norm(projected_1)
+        normalized_2 = self.compatibility_norm(projected_2)
+        # scale: [B, Lx, D]
+
+        compatibility_1 = self.compatibility_projection(normalized_1)
+        compatibility_2 = self.compatibility_projection(normalized_2)
+        # scale: [B, Lx, metric_rank: R]
+
+        weighted_compatibility_1 = compatibility_1 * self.compatibility_metric
+
+        compatibility_evidence = torch.bmm(
+            weighted_compatibility_1,
+            compatibility_2.transpose(1, 2)
+        )
+        compatibility_evidence = (
+            compatibility_evidence / math.sqrt(self.compatibility_rank)
+        )
+        compatibility_evidence = compatibility_evidence.masked_fill(
+            ~pair_mask, 0.0
+        )
+        # shape: [B, L1, L2]
+
+        ### Putting all together, query, compatibility and bias
+        contact_logits = (
+            query_evidence 
+            + self.compatibility_scale * compatibility_evidence
+            + self.contact_bias
+        )
 
         if return_patch_details:
             return contact_logits, patch_masks_1, patch_masks_2, patch_strengths
@@ -215,6 +272,8 @@ class QueryPatchInteractionModel(DScriptInteractionModel):
         query_layers: int = 1,
         query_dropout: float = 0.1,
         contact_bias_init: float = -6.0,
+        compatibility_rank: int = 32,
+        compatibility_scale_init: float = 0.05,
     ) -> None:
         # Constructing the common parent first retains its projection, public
         # prediction API, constrained interaction parameters, and both pooling
@@ -242,6 +301,8 @@ class QueryPatchInteractionModel(DScriptInteractionModel):
             num_layers=query_layers,
             dropout=query_dropout,
             contact_bias_init=contact_bias_init,
+            compatibility_rank=compatibility_rank,
+            compatibility_scale_init=compatibility_scale_init,
         )
 
     def contact_logits(

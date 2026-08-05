@@ -1,7 +1,7 @@
 #!/bin/bash
 #
 #SBATCH --job-name=query-patch-sweep                                # Job name
-#SBATCH --array=0-27%4
+#SBATCH --array=0-59%4
 #SBATCH --output=logs/query-patch-sweep-%A_%a.out                   # Standard output (%j expands to jobId)
 #SBATCH --error=logs/query-patch-sweep-%A_%a.err                    # Standard error
 #SBATCH --partition=shared-gpu                                      # not standard otherwise no permissions
