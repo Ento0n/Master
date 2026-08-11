@@ -16,7 +16,7 @@ parameters:
     value: 0.5
   
   loss-type:
-    value: sparsity_21
+    values: [contact, sparsity_11, sparsity_21, sparsity_12, sparsity_22]
 
   trainable-final-slope:
     value: true
@@ -31,15 +31,15 @@ parameters:
     values: [8, 16, 32, 64]
   
   query-heads:
-    values: [2, 4, 5, 10]
+    values: [2, 4, 5, 10, 20]
   
   query-layers:
-    values: [1, 2, 3]
+    values: [1, 2, 3, 5, 10]
   
   query-dropout:
     distribution: uniform
     min: 0.0
-    max: 0.3
+    max: 0.8
   
   query-contact-bias-init:
     distribution: uniform
@@ -49,13 +49,11 @@ parameters:
   compatibility-rank:
     values: [16, 32, 64, 128]
 
-  compatibility-scale-init:
-    distribution: uniform
-    min: 0.05
-    max: 0.5
+  compatibility-scale:
+    values: [0, 1, 2, 5, 10, 20]
   
   max-epochs:
-    value: 96
+    value: 95
 
 command:
   - ${env}

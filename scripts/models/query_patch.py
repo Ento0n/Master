@@ -44,7 +44,7 @@ class QueryPatchContactModule(nn.Module):
         dropout: float = 0.1,
         contact_bias_init: float = -6.0,
         compatibility_rank: int = 32,
-        compatibility_scale_init: float = 0.05,
+        compatibility_scale: float = 2,
     ) -> None:
         super().__init__()
         if projection_dim <= 0:
@@ -121,8 +121,9 @@ class QueryPatchContactModule(nn.Module):
         metric[1::2] = -1.0
         self.compatibility_metric = nn.Parameter(metric)
 
-        self.compatibility_scale = nn.Parameter(
-            torch.tensor(float(compatibility_scale_init))
+        self.register_buffer(
+            "compatibility_scale",
+            torch.tensor(float(compatibility_scale))
         )
 
     def forward(
@@ -214,18 +215,24 @@ class QueryPatchContactModule(nn.Module):
         normalized_2 = self.compatibility_norm(projected_2)
         # scale: [B, Lx, D]
 
-        compatibility_1 = self.compatibility_projection(normalized_1)
-        compatibility_2 = self.compatibility_projection(normalized_2)
+        compatibility_1 = F.normalize(
+            self.compatibility_projection(normalized_1),
+            p=2,
+            dim=-1,
+        )
+        compatibility_2 = F.normalize(
+            self.compatibility_projection(normalized_2),
+            p=2,
+            dim=-1,
+        )
         # scale: [B, Lx, metric_rank: R]
 
-        weighted_compatibility_1 = compatibility_1 * self.compatibility_metric
+        # push compatibility metric into [-1, 1]
+        compatibility_metric = torch.tanh(self.compatibility_metric)
 
         compatibility_evidence = torch.bmm(
-            weighted_compatibility_1,
+            compatibility_1 * compatibility_metric,
             compatibility_2.transpose(1, 2)
-        )
-        compatibility_evidence = (
-            compatibility_evidence / math.sqrt(self.compatibility_rank)
         )
         compatibility_evidence = compatibility_evidence.masked_fill(
             ~pair_mask, 0.0
@@ -273,7 +280,7 @@ class QueryPatchInteractionModel(DScriptInteractionModel):
         query_dropout: float = 0.1,
         contact_bias_init: float = -6.0,
         compatibility_rank: int = 32,
-        compatibility_scale_init: float = 0.05,
+        compatibility_scale: float = 2,
     ) -> None:
         # Constructing the common parent first retains its projection, public
         # prediction API, constrained interaction parameters, and both pooling
@@ -302,7 +309,7 @@ class QueryPatchInteractionModel(DScriptInteractionModel):
             dropout=query_dropout,
             contact_bias_init=contact_bias_init,
             compatibility_rank=compatibility_rank,
-            compatibility_scale_init=compatibility_scale_init,
+            compatibility_scale=compatibility_scale,
         )
 
     def contact_logits(

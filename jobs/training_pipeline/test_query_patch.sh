@@ -22,4 +22,4 @@ python -m scripts.training_pipeline.execute_pipeline \
   --loss-type sparsity_21 \
   --max-epochs 2 \
   --compatibility-rank 64 \
-  --compatibility-scale-init 0.1\
+  --compatibility-scale 10\

@@ -97,8 +97,8 @@ def parse_args() -> argparse.Namespace:
         type=str,
         default=None,
         help=(
-            "Name for the output subdirectory. If omitted, it is built from "
-            "int-mod-type, loss-type, interaction-loss-lambda, and max-epochs."
+            "Name for the output subdirectory. If omitted, it is built "
+            "deterministically from the effective run arguments."
         ),
     )
     parser.add_argument("--max-length", type=int, default=1250, help="One-hot baseline pad/truncate length.")
@@ -186,7 +186,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--max-pooling", action="store_true", help="Using max pooling for normal interaction head.")
     parser.add_argument("--compatibility-rank", type=int, default=32, help="The dimension in which the compatibility for the query patch model is executed.")
-    parser.add_argument("--compatibility-scale-init", type=float, default=0.05, help="The scale in which the compatibility is applied to the contact logits.")
+    parser.add_argument("--compatibility-scale", type=float, default=2, help="The scale in which the compatibility is applied to the contact logits.")
     return parser.parse_args()
 
 
@@ -1286,7 +1286,7 @@ class QueryPatchLightningModule(DScriptLightningModule):
         query_dropout: float = 0.1,
         query_contact_bias_init: float = -6.0,
         compatibility_rank: int = 32,
-        compatibility_scale_init: float = 0.05,
+        compatibility_scale: float = 2,
     ) -> None:
         super().__init__(
             embedding_dim=embedding_dim,
@@ -1320,7 +1320,7 @@ class QueryPatchLightningModule(DScriptLightningModule):
             query_dropout=query_dropout,
             contact_bias_init=query_contact_bias_init,
             compatibility_rank=compatibility_rank,
-            compatibility_scale_init=compatibility_scale_init,
+            compatibility_scale=compatibility_scale,
         )
 
 
@@ -1392,7 +1392,7 @@ def build_data_module_and_model(
             query_dropout=args.query_dropout,
             query_contact_bias_init=args.query_contact_bias_init,
             compatibility_rank=args.compatibility_rank,
-            compatibility_scale_init=args.compatibility_scale_init,
+            compatibility_scale=args.compatibility_scale,
         )
     else:
         model = DScriptLightningModule(**model_options)
@@ -1705,25 +1705,54 @@ def main() -> None:
     args = parse_args()
     validate_args(args)
 
-    # Build a compact, reproducible directory name for sweep runs while still
-    # allowing callers to provide a custom --output-subdir. Existing D-SCRIPT
-    # names remain unchanged; query-patch runs receive an architecture prefix so
-    # they cannot overwrite a baseline run with otherwise identical settings.
+    # Build a compact, reproducible directory name from effective CLI arguments
+    # while still allowing an explicit --output-subdir override. Query-patch
+    # names include every argument varied by its sweep, plus gamma/negative-map
+    # settings because they also change model behavior or supervision. Keeping
+    # max_epochs first makes result directories easy to group and compare.
     if args.output_subdir is None:
-        scale = "g" + str(args.compatibility_scale_init).replace(".", "")
-        output_name_parts = (
-            args.int_mod_type.replace("_", ""),
-            "compatibility",
-            str(args.compatibility_rank),
-            scale,
-            str(args.max_epochs),
-        )
-        if args.model == "query_patch":
-            query_architecture = (
-                f"querypatch-q{args.num_interaction_queries}"
-                f"-h{args.query_heads}-l{args.query_layers}"
+        output_name_parts = [str(args.max_epochs), f"model={args.model}"]
+        if args.model in ("dscript", "query_patch"):
+            output_name_parts.extend(
+                (
+                    f"loss={args.loss_type}",
+                    f"lambda={args.interaction_loss_lambda}",
+                    f"int={args.int_mod_type}",
+                    f"tf={str(args.trainable_final_slope).lower()}",
+                    f"maxpool={str(args.max_pooling).lower()}",
+                    f"negmaps={str(args.negative_contact_maps).lower()}",
+                    f"gamma={args.gamma_init}",
+                )
             )
-            output_name_parts = (query_architecture, *output_name_parts)
+
+            if args.model == "query_patch":
+                # q/qh/ql are the query count, attention-head count, and decoder
+                # layer count. Exact float strings avoid merging distinct Bayes
+                # suggestions through display-oriented rounding.
+                output_name_parts.extend(
+                    (
+                        f"q={args.num_interaction_queries}",
+                        f"qh={args.query_heads}",
+                        f"ql={args.query_layers}",
+                        f"qdrop={args.query_dropout}",
+                        f"qbias={args.query_contact_bias_init}",
+                        f"rank={args.compatibility_rank}",
+                        f"scale={args.compatibility_scale}",
+                    )
+                )
+        else:
+            # The fully-connected baseline uses a different set of effective
+            # model arguments and therefore receives its own comparable suffix.
+            output_name_parts.extend(
+                (
+                    f"batch={args.batch_size}",
+                    f"lr={args.learning_rate}",
+                    f"maxlen={args.max_length}",
+                    f"hidden={args.hidden_dim}",
+                    f"dropout={args.dropout}",
+                    f"lossmode={args.loss_mode}",
+                )
+            )
         args.output_subdir = "_".join(output_name_parts)
 
     # Set pytorch lightning seed & set up tensor cores
