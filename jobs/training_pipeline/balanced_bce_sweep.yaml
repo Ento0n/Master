@@ -1,0 +1,64 @@
+# balanced_bce_sweep.yaml
+program: scripts/training_pipeline/execute_pipeline.py
+project: master
+
+method: bayes
+
+metric:
+  name: best_val_loss
+  goal: minimize
+
+parameters:
+  model:
+    values: [query_patch, dscript]
+
+  interaction-loss-lambda:
+    value: 0.5
+  
+  loss-type:
+    values: [balanced_bce, balanced_bce_dice]
+  
+  omega:
+    distribution: uniform
+    min: 0.2
+    max: 0.8
+
+  trainable-final-slope:
+    value: true
+
+  max-pooling:
+    value: true
+  
+  int-mod-type:
+    values: [max, normal]
+
+  num-interaction-queries:
+    value: 16
+  
+  query-heads:
+    value: 20
+  
+  query-layers:
+    value: 3
+  
+  query-dropout:
+    value: 0.2
+  
+  query-contact-bias-init:
+    value: -5.5
+  
+  compatibility-rank:
+    value: 128
+
+  compatibility-scale:
+    value: 10
+  
+  max-epochs:
+    value: 93
+
+command:
+  - ${env}
+  - ${interpreter}
+  - "-m"
+  - scripts.training_pipeline.execute_pipeline
+  - ${args_no_boolean_flags}

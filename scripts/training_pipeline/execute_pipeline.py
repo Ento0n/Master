@@ -174,8 +174,9 @@ def parse_args() -> argparse.Namespace:
         "--loss-type", 
         required=True,
         type=str, 
-        choices=("contact", "sparsity_11", "sparsity_12", "sparsity_21", "sparsity_22"), 
-        help="Which loss type to apply for the contact map, choices: contact, sparsity")
+        choices=("contact", "sparsity_11", "sparsity_12", "sparsity_21", "sparsity_22", "balanced_bce", "balanced_bce_dice"), 
+        help="Which loss type to apply for the contact map")
+    parser.add_argument("--omega", default=0.5, type=float, help="Weighting of positive and negative class of balanced BCE")
     parser.add_argument("--int-mod-type", default="normal", type=str, choices=("normal", "max"), help="Which loss type to apply for the contact map, choices: normal, max")
     parser.add_argument("--trainable-final-slope", action="store_true", help="DScript Interaction module slope applied.")
     parser.add_argument("--gamma-init", type=float, default=0.0, help="DScript gamma parameter of interaction module, (gamma*variance)-mean as threshold of high contacts.")
@@ -207,6 +208,9 @@ def validate_args(args: argparse.Namespace) -> None:
     # keeps each output cell centered on the same residue pair.
     if args.contact_width <= 0 or args.contact_width % 2 == 0:
         raise ValueError("--contact-width must be a positive odd integer")
+
+    if not 0.0 <= args.omega <= 1.0:
+        raise ValueError("--omega must be 1, 0 or in [0, 1]")
 
     # Query-patch attention operates in the projected residue dimension. Multi-
     # head attention splits that dimension evenly across heads, and at least one
@@ -907,7 +911,8 @@ class DScriptLightningModule(pl.LightningModule):
         interaction_module_type: str,
         trainable_final_slope: bool,
         gamma_init: float,
-        max_pooling: float,
+        max_pooling: bool,
+        omega: float,
     ) -> None:
         super().__init__()
         self.save_hyperparameters()
@@ -926,6 +931,7 @@ class DScriptLightningModule(pl.LightningModule):
         self.interaction_loss_lambda = interaction_loss_lambda
         self.contact_threshold = contact_threshold
         self.loss_type = loss_type
+        self.omega = omega
 
     def forward(
         self,
@@ -1117,6 +1123,87 @@ class DScriptLightningModule(pl.LightningModule):
                 loss_per_example * supervised_examples.to(loss_per_example.dtype)
             ).sum() / supervised_count.clamp_min(1)
             loss = contact_loss
+        elif self.loss_type == "balanced_bce" or self.loss_type == "balanced_bce_dice":
+            per_map_losses = []
+
+            for logits_i, targets_i, known_i in zip(contact_logits, true_contact_map, known_mask):
+                # Before Masking: [L1, L2]
+                logits_i = logits_i[known_i]
+                targets_i = targets_i[known_i]
+                # [K_i]
+
+                if targets_i.numel() == 0:
+                    continue
+
+                positive = targets_i == 1
+                negative = targets_i == 0
+                # [K_i]
+
+                weighted_loss = logits_i.new_zeros(())
+                active_weight = 0.0
+
+                if positive.any():
+                    positive_loss = F.binary_cross_entropy_with_logits(
+                        logits_i[positive],
+                        torch.ones_like(logits_i[positive])
+                    )
+                    weighted_loss = weighted_loss + self.omega * positive_loss
+                    active_weight += self.omega
+
+                if negative.any():
+                    negative_loss = F.binary_cross_entropy_with_logits(
+                        logits_i[negative],
+                        torch.zeros_like(logits_i[negative]),
+                    )
+                    weighted_loss = weighted_loss + (1.0 - self.omega) * negative_loss
+                    active_weight += 1.0 - self.omega
+
+                if active_weight > 0:
+                    per_map_losses.append(weighted_loss / active_weight)
+
+            if per_map_losses:
+                balanced_bce = torch.stack(per_map_losses).mean()
+            else:
+                balanced_bce = contact_logits.sum() * 0.0
+
+            if self.loss_type == "balanced_bce_dice":
+                epsilon = 1e-6
+
+                masked_targets = true_contact_map.masked_fill(~known_mask, 0.0).to(true_contact_map.dtype)
+
+                # soft dice loss acts on probabilities!
+                probabilities = contact_probabilities.masked_fill(~known_mask, 0.0)
+
+                # sum over both contact map dimensions, one value per batch item
+                map_dimensions = tuple(range(1, contact_logits.ndim)) # (1, 2) for [B, L1, L2]
+
+                soft_true_positives = (
+                    probabilities * masked_targets
+                ).sum(dim=map_dimensions)
+
+                predicted_contact_mass = probabilities.sum(dim=map_dimensions)
+                true_contact_mass = masked_targets.sum(dim=map_dimensions)
+
+                dice_coefficient = (
+                    2 * soft_true_positives + epsilon
+                ) / (
+                    predicted_contact_mass + true_contact_mass + epsilon
+                )
+
+                dice_loss_per_map = 1.0 - dice_coefficient
+
+                # Consider empty contact maps, averaging over number of maps with contacts
+                maps_with_contacts = true_contact_mass > 0
+                maps_with_contacts_float = maps_with_contacts.to(dice_loss_per_map.dtype)
+
+                dice_loss = (
+                    dice_loss_per_map * maps_with_contacts_float
+                ).sum() / maps_with_contacts_float.sum().clamp_min(1.0)
+
+                balanced_bce = balanced_bce + dice_loss
+
+            loss = balanced_bce
+        
         else:
             # Sparsity loss
             denominator = known_per_example.clamp_min(1).to(contact_probabilities.dtype)
@@ -1279,7 +1366,7 @@ class QueryPatchLightningModule(DScriptLightningModule):
         interaction_module_type: str,
         trainable_final_slope: bool,
         gamma_init: float,
-        max_pooling: float,
+        max_pooling: bool,
         num_interaction_queries: int = 32,
         query_heads: int = 4,
         query_layers: int = 1,
@@ -1287,6 +1374,7 @@ class QueryPatchLightningModule(DScriptLightningModule):
         query_contact_bias_init: float = -6.0,
         compatibility_rank: int = 32,
         compatibility_scale: float = 2,
+        omega: float = 0.5,
     ) -> None:
         super().__init__(
             embedding_dim=embedding_dim,
@@ -1302,6 +1390,7 @@ class QueryPatchLightningModule(DScriptLightningModule):
             trainable_final_slope=trainable_final_slope,
             gamma_init=gamma_init,
             max_pooling=max_pooling,
+            omega=omega,
         )
         self.save_hyperparameters()
         self.model = QueryPatchInteractionModel(
@@ -1382,6 +1471,7 @@ def build_data_module_and_model(
         trainable_final_slope=args.trainable_final_slope,
         gamma_init=args.gamma_init,
         max_pooling=args.max_pooling,
+        omega=args.omega,
     )
     if args.model == "query_patch":
         model = QueryPatchLightningModule(
@@ -1753,6 +1843,7 @@ def main() -> None:
                     f"lossmode={args.loss_mode}",
                 )
             )
+        output_name_parts.append(f"omega={args.omega}")
         args.output_subdir = "_".join(output_name_parts)
 
     # Set pytorch lightning seed & set up tensor cores
