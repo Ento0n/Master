@@ -1,8 +1,8 @@
 #!/bin/bash
 #
-#SBATCH --job-name=generate_embeddings                     # Job name
-#SBATCH --output=logs/generate_embeddings.%j.out           # Standard output (%j expands to jobId)
-#SBATCH --error=logs/generate_embeddings.%j.err            # Standard error
+#SBATCH --job-name=14_generate_embeddings                     # Job name
+#SBATCH --output=logs/14_generate_embeddings.%j.out           # Standard output (%j expands to jobId)
+#SBATCH --error=logs/14_generate_embeddings.%j.err            # Standard error
 #SBATCH --partition=shared-gpu                      # not standard otherwise no permissions
 #SBATCH --gres=gpu:1
 #SBATCH --qos=limitgpus
@@ -16,4 +16,4 @@
 set -euo pipefail
 
 python -c 'import os, sys, torch; print(f"python={sys.executable}"); print("CUDA_VISIBLE_DEVICES=" + os.environ.get("CUDA_VISIBLE_DEVICES", "<unset>")); print(f"torch={torch.__version__} torch_cuda={torch.version.cuda} cuda_available={torch.cuda.is_available()} cuda_devices={torch.cuda.device_count()}")'
-python ../generate_embeddings.py --device cuda
+python /nfs/home/students/a.spannagl/master_repository/scripts/data_pipeline/14_generate_embeddings.py --device cuda

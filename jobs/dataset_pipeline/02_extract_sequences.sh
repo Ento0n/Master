@@ -1,8 +1,8 @@
 #!/bin/bash
 #
-#SBATCH --job-name=sample_negatives_keep_homomers                     # Job name
-#SBATCH --output=logs/sample_negatives_keep_homomers.%j.out           # Standard output (%j expands to jobId)
-#SBATCH --error=logs/sample_negatives_keep_homomers.%j.err            # Standard error
+#SBATCH --job-name=02_extract_sequences                # Job name
+#SBATCH --output=logs/02_extract_sequences.%j.out      # Standard output (%j expands to jobId)
+#SBATCH --error=logs/02_extract_sequences.%j.err       # Standard error
 #SBATCH --partition=shared-cpu                      # not standard otherwise no permissions
 #SBATCH --ntasks=1                                  # Run a single task
 #SBATCH --cpus-per-task=1                           # Number of CPU cores per task
@@ -11,4 +11,4 @@
 #SBATCH --mail-type=END,FAIL                        # Mail events (NONE, BEGIN, END, FAIL, ALL)
 #SBATCH --mail-user=antspa@gmx.de                   # Where to send mail
 
-python ../sample_negatives.py --output /nfs/scratch/pdb_dimers/balanced_interactions_keep_homomers.tsv --keep-positive-homomers
+python /nfs/home/students/a.spannagl/master_repository/scripts/data_pipeline/02_extract_sequences.py

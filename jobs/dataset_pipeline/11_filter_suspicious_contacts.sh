@@ -1,8 +1,8 @@
 #!/bin/bash
 #
-#SBATCH --job-name=sample_negatives_keep_homomers_cd_hit                     # Job name
-#SBATCH --output=logs/sample_negatives_keep_homomers_cd_hit.%j.out           # Standard output (%j expands to jobId)
-#SBATCH --error=logs/sample_negatives_keep_homomers_cd_hit.%j.err            # Standard error
+#SBATCH --job-name=11_filter_suspicious_contacts                     # Job name
+#SBATCH --output=logs/11_filter_suspicious_contacts.%j.out           # Standard output (%j expands to jobId)
+#SBATCH --error=logs/11_filter_suspicious_contacts.%j.err            # Standard error
 #SBATCH --partition=shared-cpu                      # not standard otherwise no permissions
 #SBATCH --ntasks=1                                  # Run a single task
 #SBATCH --cpus-per-task=1                           # Number of CPU cores per task
@@ -11,4 +11,4 @@
 #SBATCH --mail-type=END,FAIL                        # Mail events (NONE, BEGIN, END, FAIL, ALL)
 #SBATCH --mail-user=antspa@gmx.de                   # Where to send mail
 
-python ../sample_negatives.py --input /nfs/scratch/pdb_dimers/final_final_filtered_interactions_with_partitions_cd_hit.tsv --output /nfs/scratch/pdb_dimers/balanced_interactions_keep_homomers_cd_hit.tsv --keep-positive-homomers
+python /nfs/home/students/a.spannagl/master_repository/scripts/data_pipeline/11_filter_suspicious_contacts.py

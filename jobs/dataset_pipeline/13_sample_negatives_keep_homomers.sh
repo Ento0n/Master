@@ -1,8 +1,8 @@
 #!/bin/bash
 #
-#SBATCH --job-name=create_fasta_per_split                     # Job name
-#SBATCH --output=logs/create_fasta_per_split.%j.out           # Standard output (%j expands to jobId)
-#SBATCH --error=logs/create_fasta_per_split.%j.err            # Standard error
+#SBATCH --job-name=13_sample_negatives_keep_homomers                     # Job name
+#SBATCH --output=logs/13_sample_negatives_keep_homomers.%j.out           # Standard output (%j expands to jobId)
+#SBATCH --error=logs/13_sample_negatives_keep_homomers.%j.err            # Standard error
 #SBATCH --partition=shared-cpu                      # not standard otherwise no permissions
 #SBATCH --ntasks=1                                  # Run a single task
 #SBATCH --cpus-per-task=1                           # Number of CPU cores per task
@@ -11,4 +11,4 @@
 #SBATCH --mail-type=END,FAIL                        # Mail events (NONE, BEGIN, END, FAIL, ALL)
 #SBATCH --mail-user=antspa@gmx.de                   # Where to send mail
 
-python ../create_fasta_per_split.py
+python /nfs/home/students/a.spannagl/master_repository/scripts/data_pipeline/13_sample_negatives.py --output /nfs/scratch/pdb_dimers/balanced_interactions_keep_homomers.tsv --keep-positive-homomers
