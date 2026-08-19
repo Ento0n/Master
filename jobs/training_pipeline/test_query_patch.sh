@@ -14,12 +14,19 @@
 #SBATCH --mail-type=END,FAIL                        # Mail events (NONE, BEGIN, END, FAIL, ALL)
 #SBATCH --mail-user=antspa@gmx.de                   # Where to send mail
 
+set -euo pipefail
+
+# An optional first argument overrides the automatically generated result
+# subdirectory, for example: sbatch esm2_query_patch.sh my_debug_run
+output_subdir_args=()
+if [[ $# -ge 1 ]]; then
+    output_subdir_args=(--output-subdir "$1")
+fi
+
 cd /nfs/home/students/a.spannagl/master_repository
 python -m scripts.training_pipeline.execute_pipeline \
   --model query_patch \
-  --interaction-loss-lambda 0.5 \
   --int-mod-type max \
-  --loss-type sparsity_21 \
+  --loss-type balanced_bce \
   --max-epochs 2 \
-  --compatibility-rank 64 \
-  --compatibility-scale 10\
+  "${output_subdir_args[@]}" \

@@ -6,7 +6,8 @@ Data flow for one protein pair:
         -> shared D-SCRIPT projection
         -> learned queries attend to both projected proteins
         -> each query predicts one mask on each protein and a patch strength
-        -> the low-rank patches are composed into one dense contact-logit map
+        -> matched query patches form a soft gate over residue pairs
+        -> compatibility proposes contacts only where that gate is open
         -> the existing D-SCRIPT normal or max interaction head pools that map
 
 The transformer never receives structural annotation masks. ``mask_1`` and
@@ -45,6 +46,7 @@ class QueryPatchContactModule(nn.Module):
         contact_bias_init: float = -6.0,
         compatibility_rank: int = 32,
         compatibility_scale: float = 2,
+        query_gate_bias_init: float = 0.0,
     ) -> None:
         super().__init__()
         if projection_dim <= 0:
@@ -99,12 +101,19 @@ class QueryPatchContactModule(nn.Module):
         nn.init.eye_(self.query_mask_projection.weight)
         nn.init.eye_(self.residue_mask_projection.weight)
 
-        # Each query contributes a non-negative contact patch. A negative bias
-        # on initial strength and a strongly negative global background logit
-        # reflect that true inter-protein contacts are rare map cells.
+        # Each query contributes a non-negative gate patch. A negative initial
+        # strength keeps those patches modest, while contact_bias is the sparse
+        # background logit of the separate compatibility contact branch.
         self.patch_strength = nn.Linear(projection_dim, 1)
         nn.init.constant_(self.patch_strength.bias, -2.0)
         self.contact_bias = nn.Parameter(torch.tensor(float(contact_bias_init)))
+
+        # Query evidence is non-negative, so a positive learned scale preserves
+        # the interpretation that stronger matched patches open the gate. The
+        # raw value is initialized so softplus(raw_scale) is exactly one.
+        initial_raw_scale = math.log(math.expm1(1.0))
+        self.query_gate_raw_scale = nn.Parameter(torch.tensor(initial_raw_scale))
+        self.query_gate_bias = nn.Parameter(torch.tensor(float(query_gate_bias_init)))
 
         # compatibility: allowing the model to learn interface connections
         self.compatibility_rank = compatibility_rank
@@ -133,13 +142,24 @@ class QueryPatchContactModule(nn.Module):
         mask_1: torch.Tensor | None = None,
         mask_2: torch.Tensor | None = None,
         return_patch_details: bool = False,
-    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> (
+        torch.Tensor
+        | tuple[
+            torch.Tensor,
+            torch.Tensor,
+            torch.Tensor,
+            torch.Tensor,
+            torch.Tensor,
+            torch.Tensor,
+        ]
+    ):
         """Return contact logits, optionally with both masks and strengths.
 
         ``mask_1`` and ``mask_2`` are boolean sequence-padding masks with shapes
         ``[B, L1]`` and ``[B, L2]``. ``True`` means a real residue. When patch
-        details are requested, the additional outputs have shapes ``[B,K,L1]``,
-        ``[B,K,L2]``, and ``[B,K]`` respectively.
+        details are requested, the additional outputs are the two query masks
+        ``[B,K,L1]``/``[B,K,L2]``, strengths ``[B,K]``, query evidence
+        ``[B,L1,L2]``, and gate logits ``[B,L1,L2]``.
         """
         if projected_1.ndim != 3 or projected_2.ndim != 3:
             raise ValueError("projected residue tensors must be shaped [batch, residues, projection_dim]")
@@ -198,9 +218,9 @@ class QueryPatchContactModule(nn.Module):
         patch_masks_2 = torch.sigmoid(mask_logits_2).masked_fill(~mask_2[:, None, :], 0.0)
         patch_strengths = F.softplus(self.patch_strength(query_states).squeeze(-1))
 
-        # A^T diag(strength) B composes K rank-one patches directly into one
-        # [B,L1,L2] tensor. Scaling keeps initial logit magnitudes comparable
-        # when num_queries changes; contact_bias supplies the sparse background.
+        # A^T diag(strength) B composes K rank-one patches into one [B,L1,L2]
+        # gate-evidence tensor. Scaling keeps its initial magnitude comparable
+        # when num_queries changes.
         weighted_masks_1 = patch_masks_1 * patch_strengths[:, :, None]
         query_evidence = torch.bmm(weighted_masks_1.transpose(1, 2), patch_masks_2)
         query_evidence = query_evidence / math.sqrt(self.num_queries)
@@ -239,15 +259,36 @@ class QueryPatchContactModule(nn.Module):
         )
         # shape: [B, L1, L2]
 
-        ### Putting all together, query, compatibility and bias
-        contact_logits = (
-            query_evidence 
-            + self.compatibility_scale * compatibility_evidence
-            + self.contact_bias
+        ### Use query patches as a soft prerequisite for compatibility
+        gate_scale = F.softplus(self.query_gate_raw_scale)
+        query_gate_logits = gate_scale * query_evidence + self.query_gate_bias
+
+        compatibility_contact_logits = (
+            self.compatibility_scale * compatibility_evidence + self.contact_bias
+        )
+
+        # The final contact probability is exactly
+        #   sigmoid(query_gate_logits) * sigmoid(compatibility_contact_logits).
+        # Converting this product back to a logit with log-add-exp keeps BCE
+        # numerically stable. It also makes the query gate a strict prerequisite:
+        # compatibility can never raise contact probability above gate probability.
+        contact_logits = -torch.logaddexp(
+            -query_gate_logits,
+            torch.logaddexp(
+                -compatibility_contact_logits,
+                -query_gate_logits - compatibility_contact_logits,
+            ),
         )
 
         if return_patch_details:
-            return contact_logits, patch_masks_1, patch_masks_2, patch_strengths
+            return (
+                contact_logits,
+                patch_masks_1,
+                patch_masks_2,
+                patch_strengths,
+                query_evidence,
+                query_gate_logits,
+            )
         return contact_logits
 
     def clip_parameters(self) -> None:
@@ -281,6 +322,7 @@ class QueryPatchInteractionModel(DScriptInteractionModel):
         contact_bias_init: float = -6.0,
         compatibility_rank: int = 32,
         compatibility_scale: float = 2,
+        query_gate_bias_init: float = 0.0,
     ) -> None:
         # Constructing the common parent first retains its projection, public
         # prediction API, constrained interaction parameters, and both pooling
@@ -310,6 +352,7 @@ class QueryPatchInteractionModel(DScriptInteractionModel):
             contact_bias_init=contact_bias_init,
             compatibility_rank=compatibility_rank,
             compatibility_scale=compatibility_scale,
+            query_gate_bias_init=query_gate_bias_init,
         )
 
     def contact_logits(
@@ -325,7 +368,7 @@ class QueryPatchInteractionModel(DScriptInteractionModel):
         model-specific override passes them only to the Transformer contact
         module, keeping the baseline implementation and behavior unchanged.
         """
-        contact_logits, _, _, _ = self.query_patch_outputs(
+        contact_logits, _, _, _, _, _ = self.query_patch_outputs(
             embeddings_1,
             embeddings_2,
             mask_1,
@@ -339,8 +382,15 @@ class QueryPatchInteractionModel(DScriptInteractionModel):
         embeddings_2: torch.Tensor,
         mask_1: torch.Tensor | None = None,
         mask_2: torch.Tensor | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Return contact logits, A/B query masks, and positive strengths.
+    ) -> tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+    ]:
+        """Return contact logits, query patches, evidence, and gate logits.
 
         This diagnostic method exposes which residues each learned query selects
         without changing the standard D-SCRIPT-compatible ``forward`` contract.
@@ -357,7 +407,44 @@ class QueryPatchInteractionModel(DScriptInteractionModel):
             mask_2,
             return_patch_details=True,
         )
-        contact_logits, patch_masks_1, patch_masks_2, patch_strengths = outputs
+        (
+            contact_logits,
+            patch_masks_1,
+            patch_masks_2,
+            patch_strengths,
+            query_evidence,
+            query_gate_logits,
+        ) = outputs
         pair_mask = self._pair_mask(contact_logits, mask_1, mask_2)
         contact_logits = contact_logits.masked_fill(~pair_mask, 0.0)
-        return contact_logits, patch_masks_1, patch_masks_2, patch_strengths
+        query_gate_logits = query_gate_logits.masked_fill(~pair_mask, -20.0)
+        return (
+            contact_logits,
+            patch_masks_1,
+            patch_masks_2,
+            patch_strengths,
+            query_evidence,
+            query_gate_logits,
+        )
+
+    def _contact_logits_with_aux(
+        self,
+        embeddings_1: torch.Tensor,
+        embeddings_2: torch.Tensor,
+        mask_1: torch.Tensor | None = None,
+        mask_2: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        """Expose gate tensors to training without a second decoder pass."""
+        (
+            contact_logits,
+            _,
+            _,
+            _,
+            _,
+            query_gate_logits,
+        ) = self.query_patch_outputs(embeddings_1, embeddings_2, mask_1, mask_2)
+        return contact_logits, {
+            "query_gate_logits": query_gate_logits,
+            "query_gate_scale": F.softplus(self.contact_module.query_gate_raw_scale),
+            "query_gate_bias": self.contact_module.query_gate_bias,
+        }

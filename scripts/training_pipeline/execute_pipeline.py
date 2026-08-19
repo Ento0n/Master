@@ -25,6 +25,7 @@ from lightning.pytorch.callbacks import ModelCheckpoint, EarlyStopping
 from lightning.pytorch.loggers import CSVLogger, WandbLogger
 
 from scripts.models import DScriptInteractionModel, FullyConnectedInteractionModel, QueryPatchInteractionModel
+from scripts.training_pipeline.losses import balanced_binary_cross_entropy_per_map
 
 
 # =============================================================================
@@ -141,7 +142,19 @@ def parse_args() -> argparse.Namespace:
         "--query-contact-bias-init",
         type=float,
         default=-6.0,
-        help="Initial background contact logit for the sparse query_patch map.",
+        help="Initial background contact logit of the compatibility branch.",
+    )
+    parser.add_argument(
+        "--query-gate-bias-init",
+        type=float,
+        default=0.0,
+        help="Initial logit bias of the query-patch compatibility gate.",
+    )
+    parser.add_argument(
+        "--query-gate-loss-weight",
+        type=float,
+        default=0.2,
+        help="Auxiliary balanced-BCE weight that trains query gate logits directly.",
     )
     parser.add_argument(
         "--interaction-loss-lambda",
@@ -186,8 +199,8 @@ def parse_args() -> argparse.Namespace:
         help="Use zero contact targets for negative examples instead of unknown (-1).",
     )
     parser.add_argument("--max-pooling", action="store_true", help="Using max pooling for normal interaction head.")
-    parser.add_argument("--compatibility-rank", type=int, default=32, help="The dimension in which the compatibility for the query patch model is executed.")
-    parser.add_argument("--compatibility-scale", type=float, default=2, help="The scale in which the compatibility is applied to the contact logits.")
+    parser.add_argument("--compatibility-rank", type=int, default=64, help="The dimension in which the compatibility for the query patch model is executed.")
+    parser.add_argument("--compatibility-scale", type=float, default=10, help="The scale in which the compatibility is applied to the contact logits.")
     return parser.parse_args()
 
 
@@ -224,6 +237,8 @@ def validate_args(args: argparse.Namespace) -> None:
             raise ValueError("--query-layers must be positive")
         if not 0.0 <= args.query_dropout < 1.0:
             raise ValueError("--query-dropout must be in [0, 1)")
+        if args.query_gate_loss_weight < 0.0:
+            raise ValueError("--query-gate-loss-weight must be non-negative")
 
 
 def split_pair(value: object, column_name: str) -> tuple[str, str]:
@@ -953,7 +968,7 @@ class DScriptLightningModule(pl.LightningModule):
         # - interaction_logits: one raw logit per protein pair,
         # - contact_probabilities: sigmoid(contact_logits), values in [0, 1],
         # - contact_logits: raw per-cell logits for stable contact BCE.
-        interaction_logits, contact_probabilities, contact_logits = self.model(
+        interaction_logits, contact_probabilities, contact_logits, contact_aux = self.model(
             batch["embedding_1"],
             batch["embedding_2"],
             batch["mask_1"],
@@ -961,6 +976,7 @@ class DScriptLightningModule(pl.LightningModule):
             interaction_pair_mask=batch["interaction_pair_mask"],
             return_contact_map=True,
             return_contact_logits=True,
+            return_contact_aux=True,
         )
 
         # Pair-level interaction loss is computed for every row in the batch,
@@ -983,6 +999,13 @@ class DScriptLightningModule(pl.LightningModule):
             contact_probabilities,
             batch,
         )
+        auxiliary_contact_loss, auxiliary_metrics = self.compute_auxiliary_contact_loss(
+            contact_aux,
+            batch,
+        )
+        # Model-specific auxiliary terms belong to the contact objective and
+        # therefore inherit the same (1 - interaction_loss_lambda) task weight.
+        contact_objective = contact_loss + auxiliary_contact_loss
 
         if contact_logits.is_cuda:
             torch.cuda.synchronize(contact_logits.device)
@@ -997,18 +1020,24 @@ class DScriptLightningModule(pl.LightningModule):
             prog_bar=True,
         )
 
-        # Lambda controls the tradeoff between the two tasks:
+        # Lambda controls the tradeoff between the two shared tasks:
         #   lambda = 1.0 -> only interaction prediction,
         #   lambda = 0.0 -> only contact-map prediction when maps are present.
         # If a batch has no known contact cells, falling back to interaction loss
         # avoids multiplying by a zero contact loss and wasting the batch.
-        mixed_loss = (
-            self.interaction_loss_lambda * interaction_loss + (1.0 - self.interaction_loss_lambda) * contact_loss
+        mixed_task_loss = (
+            self.interaction_loss_lambda * interaction_loss
+            + (1.0 - self.interaction_loss_lambda) * contact_loss
         )
-        loss = torch.where(
+        task_loss = torch.where(
             contact_metrics["has_contact_supervision"],
-            mixed_loss,
+            mixed_task_loss,
             interaction_loss,
+        )
+        optimization_loss = torch.where(
+            contact_metrics["has_contact_supervision"],
+            task_loss + (1.0 - self.interaction_loss_lambda) * auxiliary_contact_loss,
+            task_loss,
         )
 
         # Interaction classification uses the same probability cutoff as the
@@ -1017,7 +1046,17 @@ class DScriptLightningModule(pl.LightningModule):
         interaction_accuracy = (interaction_predictions == labels).float().mean()
 
         batch_size = labels.size(0)
-        self.log(f"{stage}_loss", loss, prog_bar=True, on_step=False, on_epoch=True, batch_size=batch_size)
+        # Keep stage_loss model-independent for checkpointing and mixed-model
+        # sweeps. Query-patch still optimizes the auxiliary term, which is
+        # reported separately as stage_optimization_loss below.
+        self.log(
+            f"{stage}_loss",
+            task_loss,
+            prog_bar=True,
+            on_step=False,
+            on_epoch=True,
+            batch_size=batch_size,
+        )
         self.log(
             f"{stage}_interaction_loss",
             interaction_loss,
@@ -1034,6 +1073,40 @@ class DScriptLightningModule(pl.LightningModule):
             on_epoch=True,
             batch_size=batch_size,
         )
+        if contact_aux:
+            self.log(
+                f"{stage}_optimization_loss",
+                optimization_loss,
+                prog_bar=False,
+                on_step=False,
+                on_epoch=True,
+                batch_size=batch_size,
+            )
+        if auxiliary_metrics:
+            # Every auxiliary objective is averaged over supervised contact
+            # maps, which is also the weight of the first returned metric.
+            objective_weight = next(iter(auxiliary_metrics.values()))[1]
+            self.log(
+                f"{stage}_contact_objective",
+                contact_objective,
+                prog_bar=False,
+                on_step=False,
+                on_epoch=True,
+                batch_size=objective_weight,
+            )
+            # Auxiliary diagnostics are aggregated with the population they
+            # summarize (supervised maps, known cells, positive cells, etc.).
+            # Using the full batch size would let unlabeled examples bias the
+            # epoch means.
+            for metric_name, (metric_value, metric_weight) in auxiliary_metrics.items():
+                self.log(
+                    f"{stage}_{metric_name}",
+                    metric_value,
+                    prog_bar=False,
+                    on_step=False,
+                    on_epoch=True,
+                    batch_size=metric_weight,
+                )
         self.log(
             f"{stage}_accuracy",
             interaction_accuracy,
@@ -1049,7 +1122,7 @@ class DScriptLightningModule(pl.LightningModule):
         if stage == "test":
             log_test_accuracy_by_dimer_type(self, batch["dimer_type_index"], interaction_predictions, labels)
 
-        return loss
+        return optimization_loss
 
     def compute_contact_loss_and_metrics(
         self,
@@ -1124,47 +1197,12 @@ class DScriptLightningModule(pl.LightningModule):
             ).sum() / supervised_count.clamp_min(1)
             loss = contact_loss
         elif self.loss_type == "balanced_bce" or self.loss_type == "balanced_bce_dice":
-            per_map_losses = []
-
-            for logits_i, targets_i, known_i in zip(contact_logits, true_contact_map, known_mask):
-                # Before Masking: [L1, L2]
-                logits_i = logits_i[known_i]
-                targets_i = targets_i[known_i]
-                # [K_i]
-
-                if targets_i.numel() == 0:
-                    continue
-
-                positive = targets_i == 1
-                negative = targets_i == 0
-                # [K_i]
-
-                weighted_loss = logits_i.new_zeros(())
-                active_weight = 0.0
-
-                if positive.any():
-                    positive_loss = F.binary_cross_entropy_with_logits(
-                        logits_i[positive],
-                        torch.ones_like(logits_i[positive])
-                    )
-                    weighted_loss = weighted_loss + self.omega * positive_loss
-                    active_weight += self.omega
-
-                if negative.any():
-                    negative_loss = F.binary_cross_entropy_with_logits(
-                        logits_i[negative],
-                        torch.zeros_like(logits_i[negative]),
-                    )
-                    weighted_loss = weighted_loss + (1.0 - self.omega) * negative_loss
-                    active_weight += 1.0 - self.omega
-
-                if active_weight > 0:
-                    per_map_losses.append(weighted_loss / active_weight)
-
-            if per_map_losses:
-                balanced_bce = torch.stack(per_map_losses).mean()
-            else:
-                balanced_bce = contact_logits.sum() * 0.0
+            balanced_bce = balanced_binary_cross_entropy_per_map(
+                contact_logits,
+                true_contact_map,
+                known_mask,
+                self.omega,
+            )
 
             if self.loss_type == "balanced_bce_dice":
                 epsilon = 1e-6
@@ -1258,6 +1296,20 @@ class DScriptLightningModule(pl.LightningModule):
             "contact_precision": precision,
             "contact_recall": recall,
         }
+
+    def compute_auxiliary_contact_loss(
+        self,
+        contact_aux: dict[str, torch.Tensor],
+        batch: dict[str, torch.Tensor],
+    ) -> tuple[torch.Tensor, dict[str, tuple[torch.Tensor, int]]]:
+        """Return optional model-specific contact loss and diagnostics.
+
+        The D-SCRIPT baseline has no auxiliary contact-head objective. Keeping
+        this hook in the shared training step lets query-patch add gate
+        supervision without duplicating interaction pooling or the main loss.
+        """
+        del contact_aux
+        return batch["label"].new_zeros(()), {}
 
     def log_contact_metrics(
         self,
@@ -1372,6 +1424,8 @@ class QueryPatchLightningModule(DScriptLightningModule):
         query_layers: int = 1,
         query_dropout: float = 0.1,
         query_contact_bias_init: float = -6.0,
+        query_gate_bias_init: float = 0.0,
+        query_gate_loss_weight: float = 0.2,
         compatibility_rank: int = 32,
         compatibility_scale: float = 2,
         omega: float = 0.5,
@@ -1393,6 +1447,7 @@ class QueryPatchLightningModule(DScriptLightningModule):
             omega=omega,
         )
         self.save_hyperparameters()
+        self.query_gate_loss_weight = query_gate_loss_weight
         self.model = QueryPatchInteractionModel(
             embedding_dim=embedding_dim,
             projection_dim=projection_dim,
@@ -1408,9 +1463,73 @@ class QueryPatchLightningModule(DScriptLightningModule):
             query_layers=query_layers,
             query_dropout=query_dropout,
             contact_bias_init=query_contact_bias_init,
+            query_gate_bias_init=query_gate_bias_init,
             compatibility_rank=compatibility_rank,
             compatibility_scale=compatibility_scale,
         )
+
+    def compute_auxiliary_contact_loss(
+        self,
+        contact_aux: dict[str, torch.Tensor],
+        batch: dict[str, torch.Tensor],
+    ) -> tuple[torch.Tensor, dict[str, tuple[torch.Tensor, int]]]:
+        """Train and monitor the query gate on known residue-pair labels."""
+        query_gate_logits = contact_aux["query_gate_logits"]
+        true_contact_map = batch["contact_map"]
+        known_mask = true_contact_map >= 0
+
+        gate_loss = balanced_binary_cross_entropy_per_map(
+            query_gate_logits,
+            true_contact_map,
+            known_mask,
+            self.omega,
+        )
+        weighted_gate_loss = self.query_gate_loss_weight * gate_loss
+
+        # Collapse diagnostics use known cells only. Positive/negative means
+        # reveal whether the gate actually separates contacts; fractions near
+        # zero or one expose globally closed/open solutions.
+        supervised_map_count = int(known_mask.flatten(start_dim=1).any(dim=1).sum().item())
+        known_probabilities = torch.sigmoid(query_gate_logits[known_mask])
+        known_targets = true_contact_map[known_mask]
+        if known_probabilities.numel() == 0:
+            # Do not emit artificial zeros: batches without any known contact
+            # cells must not pull epoch-level gate diagnostics toward zero.
+            return weighted_gate_loss, {}
+
+        known_count = int(known_probabilities.numel())
+        positive = known_targets == 1
+        negative = known_targets == 0
+        positive_count = int(positive.sum().item())
+        negative_count = int(negative.sum().item())
+
+        metrics: dict[str, tuple[torch.Tensor, int]] = {
+            "query_gate_loss": (gate_loss, supervised_map_count),
+            "query_gate_weighted_loss": (weighted_gate_loss, supervised_map_count),
+            "query_gate_mean": (known_probabilities.mean(), known_count),
+            "query_gate_open_fraction": (
+                (known_probabilities >= 0.9).to(query_gate_logits.dtype).mean(),
+                known_count,
+            ),
+            "query_gate_closed_fraction": (
+                (known_probabilities <= 0.1).to(query_gate_logits.dtype).mean(),
+                known_count,
+            ),
+            "query_gate_scale": (contact_aux["query_gate_scale"], supervised_map_count),
+            "query_gate_bias": (contact_aux["query_gate_bias"], supervised_map_count),
+        }
+        if positive_count > 0:
+            metrics["query_gate_positive_mean"] = (
+                known_probabilities[positive].mean(),
+                positive_count,
+            )
+        if negative_count > 0:
+            metrics["query_gate_negative_mean"] = (
+                known_probabilities[negative].mean(),
+                negative_count,
+            )
+
+        return weighted_gate_loss, metrics
 
 
 # =============================================================================
@@ -1481,6 +1600,8 @@ def build_data_module_and_model(
             query_layers=args.query_layers,
             query_dropout=args.query_dropout,
             query_contact_bias_init=args.query_contact_bias_init,
+            query_gate_bias_init=args.query_gate_bias_init,
+            query_gate_loss_weight=args.query_gate_loss_weight,
             compatibility_rank=args.compatibility_rank,
             compatibility_scale=args.compatibility_scale,
         )
@@ -1826,6 +1947,8 @@ def main() -> None:
                         f"ql={args.query_layers}",
                         f"qdrop={args.query_dropout}",
                         f"qbias={args.query_contact_bias_init}",
+                        f"qgbias={args.query_gate_bias_init}",
+                        f"qgatew={args.query_gate_loss_weight}",
                         f"rank={args.compatibility_rank}",
                         f"scale={args.compatibility_scale}",
                     )

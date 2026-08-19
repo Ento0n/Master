@@ -217,6 +217,21 @@ class DScriptInteractionModel(nn.Module):
         pair_mask = self._pair_mask(logits, mask_1, mask_2)
         return logits.masked_fill(~pair_mask, 0.0)
 
+    def _contact_logits_with_aux(
+        self,
+        embeddings_1: torch.Tensor,
+        embeddings_2: torch.Tensor,
+        mask_1: torch.Tensor | None = None,
+        mask_2: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        """Return contact logits and optional model-specific training tensors.
+
+        D-SCRIPT has no auxiliary contact-head outputs. Query-patch overrides
+        this hook so the shared forward pass can expose its gate logits without
+        running the projection and Transformer decoder a second time.
+        """
+        return self.contact_logits(embeddings_1, embeddings_2, mask_1, mask_2), {}
+
     def contact_map(
         self,
         embeddings_1: torch.Tensor,
@@ -279,12 +294,28 @@ class DScriptInteractionModel(nn.Module):
         return_contact_map: bool = False,
         return_contact_logits: bool = False,
         interaction_pair_mask: torch.Tensor | None = None,
-    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor] | tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        return_contact_aux: bool = False,
+    ) -> (
+        torch.Tensor
+        | tuple[torch.Tensor, torch.Tensor]
+        | tuple[torch.Tensor, torch.Tensor, torch.Tensor]
+        | tuple[torch.Tensor, torch.Tensor, torch.Tensor, dict[str, torch.Tensor]]
+    ):
         """Return interaction logits, optionally with contact probabilities/logits."""
+        if return_contact_aux and not (return_contact_map and return_contact_logits):
+            raise ValueError(
+                "return_contact_aux requires return_contact_map and return_contact_logits"
+            )
+
         # Contact logits are needed for BCEWithLogits contact-map supervision.
         # Contact probabilities are needed for D-SCRIPT-style pooling and for
         # human-interpretable/thresholded metrics.
-        contact_logits = self.contact_logits(embeddings_1, embeddings_2, mask_1, mask_2)
+        contact_logits, contact_aux = self._contact_logits_with_aux(
+            embeddings_1,
+            embeddings_2,
+            mask_1,
+            mask_2,
+        )
         contacts = torch.sigmoid(contact_logits)
         pair_mask = self._pair_mask(contacts, mask_1, mask_2)
         contacts = contacts.masked_fill(~pair_mask, 0.0)
@@ -363,6 +394,8 @@ class DScriptInteractionModel(nn.Module):
 
 
         if return_contact_map and return_contact_logits:
+            if return_contact_aux:
+                return logits, contacts, contact_logits, contact_aux
             return logits, contacts, contact_logits
         if return_contact_logits:
             return logits, contact_logits

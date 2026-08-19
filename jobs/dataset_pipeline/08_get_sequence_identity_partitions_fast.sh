@@ -1,8 +1,8 @@
 #!/bin/bash
 #
-#SBATCH --job-name=get_seq_ident_partitions_fast                     # Job name
-#SBATCH --output=logs/get_seq_ident_partitions_fast.%j.out           # Standard output (%j expands to jobId)
-#SBATCH --error=logs/get_seq_ident_partitions_fast.%j.err            # Standard error
+#SBATCH --job-name=08_get_seq_ident_partitions_fast                     # Job name
+#SBATCH --output=logs/g08_et_seq_ident_partitions_fast.%j.out           # Standard output (%j expands to jobId)
+#SBATCH --error=logs/08_get_seq_ident_partitions_fast.%j.err            # Standard error
 #SBATCH --partition=shared-cpu                      # not standard otherwise no permissions
 ##SBATCH --nodelist=grover.exbio.wzw.tum.de          # on compms I get illegal instruction error
 #SBATCH --ntasks=1                                  # Run a single task
@@ -13,7 +13,7 @@
 #SBATCH --mail-user=antspa@gmx.de                   # Where to send mail
 
 /nfs/home/students/a.spannagl/.local/kahip64/bin/kaffpa \
-  /nfs/scratch/pdb_dimers/MMseqs2/sequence_identity.graph \
+  /nfs/scratch/pdb_dimers/graphs/sequence_identity.graph \
   --k=10 \
   --preconfiguration=fast \
   --imbalance=3 \
