@@ -151,6 +151,9 @@ class QueryPatchContactModule(nn.Module):
             torch.Tensor,
             torch.Tensor,
             torch.Tensor,
+            torch.Tensor,
+            torch.Tensor,
+            torch.Tensor,
         ]
     ):
         """Return contact logits, optionally with both masks and strengths.
@@ -159,7 +162,8 @@ class QueryPatchContactModule(nn.Module):
         ``[B, L1]`` and ``[B, L2]``. ``True`` means a real residue. When patch
         details are requested, the additional outputs are the two query masks
         ``[B,K,L1]``/``[B,K,L2]``, strengths ``[B,K]``, query evidence
-        ``[B,L1,L2]``, and gate logits ``[B,L1,L2]``.
+        ``[B,L1,L2]``, gate logits ``[B,L1,L2]``, compatibility logits
+        ``[B,L1,L2]``, and chain-wise interface logits ``[B,L1]``/``[B,L2]``.
         """
         if projected_1.ndim != 3 or projected_2.ndim != 3:
             raise ValueError("projected residue tensors must be shaped [batch, residues, projection_dim]")
@@ -213,6 +217,12 @@ class QueryPatchContactModule(nn.Module):
         mask_logits_1 = torch.bmm(query_features, residue_features_1.transpose(1, 2)) / scale
         mask_logits_2 = torch.bmm(query_features, residue_features_2.transpose(1, 2)) / scale
         # shape: [B, K, L]
+
+        # A residue belongs to the predicted interface when at least one query
+        # selects it. Max aggregation lets queries specialize: positive residues
+        # need one matching slot, while a negative residue forces every slot low.
+        interface_logits_1 = mask_logits_1.amax(dim=1).masked_fill(~mask_1, -20.0)
+        interface_logits_2 = mask_logits_2.amax(dim=1).masked_fill(~mask_2, -20.0)
 
         patch_masks_1 = torch.sigmoid(mask_logits_1).masked_fill(~mask_1[:, None, :], 0.0)
         patch_masks_2 = torch.sigmoid(mask_logits_2).masked_fill(~mask_2[:, None, :], 0.0)
@@ -288,6 +298,9 @@ class QueryPatchContactModule(nn.Module):
                 patch_strengths,
                 query_evidence,
                 query_gate_logits,
+                compatibility_contact_logits,
+                interface_logits_1,
+                interface_logits_2,
             )
         return contact_logits
 
@@ -368,7 +381,7 @@ class QueryPatchInteractionModel(DScriptInteractionModel):
         model-specific override passes them only to the Transformer contact
         module, keeping the baseline implementation and behavior unchanged.
         """
-        contact_logits, _, _, _, _, _ = self.query_patch_outputs(
+        contact_logits, _, _, _, _, _, _, _, _ = self.query_patch_outputs(
             embeddings_1,
             embeddings_2,
             mask_1,
@@ -389,8 +402,11 @@ class QueryPatchInteractionModel(DScriptInteractionModel):
         torch.Tensor,
         torch.Tensor,
         torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
     ]:
-        """Return contact logits, query patches, evidence, and gate logits.
+        """Return contact, query-patch, gate, compatibility, and interface tensors.
 
         This diagnostic method exposes which residues each learned query selects
         without changing the standard D-SCRIPT-compatible ``forward`` contract.
@@ -414,10 +430,16 @@ class QueryPatchInteractionModel(DScriptInteractionModel):
             patch_strengths,
             query_evidence,
             query_gate_logits,
+            compatibility_contact_logits,
+            interface_logits_1,
+            interface_logits_2,
         ) = outputs
         pair_mask = self._pair_mask(contact_logits, mask_1, mask_2)
         contact_logits = contact_logits.masked_fill(~pair_mask, 0.0)
         query_gate_logits = query_gate_logits.masked_fill(~pair_mask, -20.0)
+        compatibility_contact_logits = compatibility_contact_logits.masked_fill(
+            ~pair_mask, -20.0
+        )
         return (
             contact_logits,
             patch_masks_1,
@@ -425,6 +447,9 @@ class QueryPatchInteractionModel(DScriptInteractionModel):
             patch_strengths,
             query_evidence,
             query_gate_logits,
+            compatibility_contact_logits,
+            interface_logits_1,
+            interface_logits_2,
         )
 
     def _contact_logits_with_aux(
@@ -434,7 +459,7 @@ class QueryPatchInteractionModel(DScriptInteractionModel):
         mask_1: torch.Tensor | None = None,
         mask_2: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
-        """Expose gate tensors to training without a second decoder pass."""
+        """Expose branch-specific tensors without a second decoder pass."""
         (
             contact_logits,
             _,
@@ -442,9 +467,15 @@ class QueryPatchInteractionModel(DScriptInteractionModel):
             _,
             _,
             query_gate_logits,
+            compatibility_contact_logits,
+            interface_logits_1,
+            interface_logits_2,
         ) = self.query_patch_outputs(embeddings_1, embeddings_2, mask_1, mask_2)
         return contact_logits, {
             "query_gate_logits": query_gate_logits,
             "query_gate_scale": F.softplus(self.contact_module.query_gate_raw_scale),
             "query_gate_bias": self.contact_module.query_gate_bias,
+            "compatibility_contact_logits": compatibility_contact_logits,
+            "interface_logits_1": interface_logits_1,
+            "interface_logits_2": interface_logits_2,
         }

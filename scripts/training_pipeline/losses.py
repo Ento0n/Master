@@ -14,11 +14,11 @@ def balanced_binary_cross_entropy_per_map(
 ) -> torch.Tensor:
     """Return class-balanced BCE averaged equally across supervised maps.
 
-    All tensors are shaped ``[B, L1, L2]``. Targets use 1 for contacts, 0 for
-    known noncontacts, and -1 for unknown/padded cells; ``known_mask`` selects
-    only the 0/1 cells. Within each map, positive and negative mean BCE receive
+    Tensors share shape ``[B, ...]``: either contact maps ``[B,L1,L2]`` or
+    chain-wise interface labels ``[B,L]``. ``known_mask`` selects supervised
+    binary targets. Within each example, positive and negative mean BCE receive
     weights ``omega`` and ``1 - omega``. If one class is absent, the active
-    class is renormalized rather than shrinking the map's contribution.
+    class is renormalized rather than shrinking the example's contribution.
     """
     if logits.shape != targets.shape or logits.shape != known_mask.shape:
         raise ValueError("logits, targets, and known_mask must have matching shapes")

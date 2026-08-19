@@ -151,10 +151,12 @@ def parse_args() -> argparse.Namespace:
         help="Initial logit bias of the query-patch compatibility gate.",
     )
     parser.add_argument(
+        "--query-interface-loss-weight",
         "--query-gate-loss-weight",
+        dest="query_gate_loss_weight",
         type=float,
         default=0.2,
-        help="Auxiliary balanced-BCE weight that trains query gate logits directly.",
+        help="Auxiliary balanced-BCE weight for chain-wise query interface masks.",
     )
     parser.add_argument(
         "--interaction-loss-lambda",
@@ -238,7 +240,7 @@ def validate_args(args: argparse.Namespace) -> None:
         if not 0.0 <= args.query_dropout < 1.0:
             raise ValueError("--query-dropout must be in [0, 1)")
         if args.query_gate_loss_weight < 0.0:
-            raise ValueError("--query-gate-loss-weight must be non-negative")
+            raise ValueError("--query-interface-loss-weight must be non-negative")
 
 
 def split_pair(value: object, column_name: str) -> tuple[str, str]:
@@ -1447,7 +1449,9 @@ class QueryPatchLightningModule(DScriptLightningModule):
             omega=omega,
         )
         self.save_hyperparameters()
-        self.query_gate_loss_weight = query_gate_loss_weight
+        # Retain the old constructor/CLI name as an alias so existing sweep
+        # configurations keep working after the objective changes meaning.
+        self.query_interface_loss_weight = query_gate_loss_weight
         self.model = QueryPatchInteractionModel(
             embedding_dim=embedding_dim,
             projection_dim=projection_dim,
@@ -1473,63 +1477,92 @@ class QueryPatchLightningModule(DScriptLightningModule):
         contact_aux: dict[str, torch.Tensor],
         batch: dict[str, torch.Tensor],
     ) -> tuple[torch.Tensor, dict[str, tuple[torch.Tensor, int]]]:
-        """Train and monitor the query gate on known residue-pair labels."""
-        query_gate_logits = contact_aux["query_gate_logits"]
+        """Train query masks on interfaces and compatibility on pair contacts."""
         true_contact_map = batch["contact_map"]
         known_mask = true_contact_map >= 0
 
-        gate_loss = balanced_binary_cross_entropy_per_map(
-            query_gate_logits,
+        # A residue is a known interface residue when any known partner cell is
+        # a contact. Rows/columns containing only -1 stay unknown and therefore
+        # do not contribute to either chain's interface-mask loss.
+        contact_mask = true_contact_map == 1
+        known_interface_1 = known_mask.any(dim=2)
+        known_interface_2 = known_mask.any(dim=1)
+        interface_targets_1 = contact_mask.any(dim=2).to(true_contact_map.dtype)
+        interface_targets_2 = contact_mask.any(dim=1).to(true_contact_map.dtype)
+        # [B, L1] & [B, L2]
+
+        interface_logits_1 = contact_aux["interface_logits_1"]
+        interface_logits_2 = contact_aux["interface_logits_2"]
+        interface_loss_1 = balanced_binary_cross_entropy_per_map(
+            interface_logits_1,
+            interface_targets_1,
+            known_interface_1,
+            self.omega,
+        )
+        interface_loss_2 = balanced_binary_cross_entropy_per_map(
+            interface_logits_2,
+            interface_targets_2,
+            known_interface_2,
+            self.omega,
+        )
+        interface_loss = 0.5 * (interface_loss_1 + interface_loss_2)
+        weighted_interface_loss = self.query_interface_loss_weight * interface_loss
+
+        # Compatibility receives its own contact-map objective. The existing
+        # main contact loss still supervises the final gated contact logits.
+        compatibility_logits = contact_aux["compatibility_contact_logits"]
+        compatibility_loss = balanced_binary_cross_entropy_per_map(
+            compatibility_logits,
             true_contact_map,
             known_mask,
             self.omega,
         )
-        weighted_gate_loss = self.query_gate_loss_weight * gate_loss
+        auxiliary_loss = weighted_interface_loss + compatibility_loss
 
-        # Collapse diagnostics use known cells only. Positive/negative means
-        # reveal whether the gate actually separates contacts; fractions near
-        # zero or one expose globally closed/open solutions.
         supervised_map_count = int(known_mask.flatten(start_dim=1).any(dim=1).sum().item())
-        known_probabilities = torch.sigmoid(query_gate_logits[known_mask])
-        known_targets = true_contact_map[known_mask]
-        if known_probabilities.numel() == 0:
+        if supervised_map_count == 0:
             # Do not emit artificial zeros: batches without any known contact
-            # cells must not pull epoch-level gate diagnostics toward zero.
-            return weighted_gate_loss, {}
+            # cells must not pull epoch-level branch diagnostics toward zero.
+            return auxiliary_loss, {}
 
-        known_count = int(known_probabilities.numel())
-        positive = known_targets == 1
-        negative = known_targets == 0
-        positive_count = int(positive.sum().item())
-        negative_count = int(negative.sum().item())
+        interface_probabilities = torch.cat(
+            (
+                torch.sigmoid(interface_logits_1[known_interface_1]),
+                torch.sigmoid(interface_logits_2[known_interface_2]),
+            )
+        )
+        interface_targets = torch.cat(
+            (
+                interface_targets_1[known_interface_1],
+                interface_targets_2[known_interface_2],
+            )
+        )
+        interface_count = int(interface_probabilities.numel())
+        positive_interface = interface_targets == 1
+        negative_interface = interface_targets == 0
+        positive_count = int(positive_interface.sum().item())
+        negative_count = int(negative_interface.sum().item())
 
         metrics: dict[str, tuple[torch.Tensor, int]] = {
-            "query_gate_loss": (gate_loss, supervised_map_count),
-            "query_gate_weighted_loss": (weighted_gate_loss, supervised_map_count),
-            "query_gate_mean": (known_probabilities.mean(), known_count),
-            "query_gate_open_fraction": (
-                (known_probabilities >= 0.9).to(query_gate_logits.dtype).mean(),
-                known_count,
-            ),
-            "query_gate_closed_fraction": (
-                (known_probabilities <= 0.1).to(query_gate_logits.dtype).mean(),
-                known_count,
-            ),
+            "interface_mask_loss": (interface_loss, supervised_map_count),
+            "interface_mask_weighted_loss": (weighted_interface_loss, supervised_map_count),
+            "compatibility_contact_loss": (compatibility_loss, supervised_map_count),
+            "interface_mask_mean": (interface_probabilities.mean(), interface_count),
             "query_gate_scale": (contact_aux["query_gate_scale"], supervised_map_count),
             "query_gate_bias": (contact_aux["query_gate_bias"], supervised_map_count),
         }
         if positive_count > 0:
-            metrics["query_gate_positive_mean"] = (
-                known_probabilities[positive].mean(),
+            metrics["interface_mask_positive_mean"] = (
+                interface_probabilities[positive_interface].mean(),
                 positive_count,
             )
         if negative_count > 0:
-            metrics["query_gate_negative_mean"] = (
-                known_probabilities[negative].mean(),
+            metrics["interface_mask_negative_mean"] = (
+                interface_probabilities[negative_interface].mean(),
                 negative_count,
             )
 
-        return weighted_gate_loss, metrics
+        return auxiliary_loss, metrics
 
 
 # =============================================================================
@@ -1948,7 +1981,7 @@ def main() -> None:
                         f"qdrop={args.query_dropout}",
                         f"qbias={args.query_contact_bias_init}",
                         f"qgbias={args.query_gate_bias_init}",
-                        f"qgatew={args.query_gate_loss_weight}",
+                        f"qifw={args.query_gate_loss_weight}",
                         f"rank={args.compatibility_rank}",
                         f"scale={args.compatibility_scale}",
                     )
