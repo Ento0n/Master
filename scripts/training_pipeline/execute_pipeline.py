@@ -19,6 +19,7 @@ import pandas as pd
 import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset
+from torchmetrics.classification import BinaryAveragePrecision
 
 import lightning.pytorch as pl
 from lightning.pytorch.callbacks import ModelCheckpoint, EarlyStopping
@@ -26,6 +27,7 @@ from lightning.pytorch.loggers import CSVLogger, WandbLogger
 
 from scripts.models import DScriptInteractionModel, FullyConnectedInteractionModel, QueryPatchInteractionModel
 from scripts.training_pipeline.losses import balanced_binary_cross_entropy_per_map
+from scripts.training_pipeline.metrics import BinnedBinaryAveragePrecision, MacroContactAveragePrecision
 
 
 # =============================================================================
@@ -401,6 +403,198 @@ def save_loss_plot(metrics_path: Path, output_path: Path) -> None:
     print(f"Saved loss plot to {output_path}")
 
 
+def save_auprc_plots(metrics_path: Path, output_dir: Path) -> None:
+    """Save separate interaction and contact AUPRC histories.
+
+    Validation AUPRC is logged once per epoch and is therefore drawn as a
+    conventional epoch curve. Test AUPRC is evaluated only once, after model
+    selection, so it is shown as a horizontal reference instead of being
+    presented as an epoch series. The contact figure includes both aggregation
+    conventions: macro gives every structural complex equal weight, while micro
+    pools all known residue pairs and gives larger maps more influence.
+    """
+    if not metrics_path.exists():
+        print(f"Skipping AUPRC plots because metrics file does not exist: {metrics_path}")
+        return
+
+    try:
+        import matplotlib
+
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+    except ImportError as exc:
+        print(f"Skipping AUPRC plots because matplotlib is not installed: {exc}")
+        return
+
+    metrics = pd.read_csv(metrics_path)
+    if "epoch" not in metrics.columns:
+        print(f"Skipping AUPRC plots because {metrics_path} has no epoch column")
+        return
+
+    def epoch_series(metric_name: str) -> pd.Series | None:
+        """Return the last logged value per zero-based Lightning epoch."""
+        if metric_name not in metrics.columns:
+            return None
+
+        # A sanity check, resumed run, or repeated logger flush can create more
+        # than one row for an epoch. Prefer the highest training step and use
+        # CSV order only as a deterministic tie-breaker. Numeric coercion makes
+        # plotting robust to a partially written or manually edited log.
+        metric_rows = pd.DataFrame(
+            {
+                "epoch": pd.to_numeric(metrics["epoch"], errors="coerce"),
+                "step": (
+                    pd.to_numeric(metrics["step"], errors="coerce")
+                    if "step" in metrics.columns
+                    else -1
+                ),
+                "value": pd.to_numeric(metrics[metric_name], errors="coerce"),
+                "row_order": np.arange(len(metrics)),
+            }
+        )
+        metric_rows = metric_rows.replace((np.inf, -np.inf), np.nan).dropna(subset=["epoch", "value"])
+        metric_rows = metric_rows[
+            (metric_rows["epoch"] >= 0)
+            & (metric_rows["epoch"] == np.floor(metric_rows["epoch"]))
+            & metric_rows["value"].between(0.0, 1.0)
+        ]
+        if metric_rows.empty:
+            return None
+
+        metric_rows["step"] = metric_rows["step"].fillna(-1)
+        metric_rows["epoch"] = metric_rows["epoch"].astype(int)
+        metric_rows = metric_rows.sort_values(["epoch", "step", "row_order"])
+        return metric_rows.groupby("epoch")["value"].last().sort_index()
+
+    def final_value(metric_name: str) -> float | None:
+        """Return the last non-missing scalar, normally the single test result."""
+        if metric_name not in metrics.columns:
+            return None
+
+        metric_rows = pd.DataFrame(
+            {
+                "step": (
+                    pd.to_numeric(metrics["step"], errors="coerce")
+                    if "step" in metrics.columns
+                    else -1
+                ),
+                "value": pd.to_numeric(metrics[metric_name], errors="coerce"),
+                "row_order": np.arange(len(metrics)),
+            }
+        )
+        metric_rows = metric_rows.replace((np.inf, -np.inf), np.nan).dropna(subset=["value"])
+        metric_rows = metric_rows[metric_rows["value"].between(0.0, 1.0)]
+        if metric_rows.empty:
+            return None
+
+        metric_rows["step"] = metric_rows["step"].fillna(-1)
+        metric_rows = metric_rows.sort_values(["step", "row_order"])
+        return float(metric_rows.iloc[-1]["value"])
+
+    def save_metric_figure(
+        validation_specs: tuple[tuple[str, str, str], ...],
+        test_specs: tuple[tuple[str, str, str], ...],
+        title: str,
+        output_path: Path,
+    ) -> None:
+        """Draw available validation histories and final test references."""
+        validation_series = [
+            (epoch_series(metric_name), display_name, color)
+            for metric_name, display_name, color in validation_specs
+        ]
+        validation_series = [item for item in validation_series if item[0] is not None]
+        test_values = [
+            (final_value(metric_name), display_name, color)
+            for metric_name, display_name, color in test_specs
+        ]
+        test_values = [item for item in test_values if item[0] is not None]
+
+        if not validation_series and not test_values:
+            expected_metrics = [spec[0] for spec in validation_specs + test_specs]
+            print(
+                f"Skipping {title.lower()} plot because none of these metrics were logged: "
+                f"{', '.join(expected_metrics)}"
+            )
+            return
+
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        figure, axis = plt.subplots(figsize=(8, 5))
+
+        for values, display_name, color in validation_series:
+            # Display epochs as 1-based values, matching the loss plot and the
+            # human-readable epoch count used in run/checkpoint descriptions.
+            axis.plot(
+                values.index + 1,
+                values.values,
+                color=color,
+                marker="o",
+                label=display_name,
+            )
+
+        if validation_series:
+            for value, display_name, color in test_values:
+                # A dashed reference communicates that test is a single final
+                # evaluation of the selected checkpoint, not a quantity
+                # repeatedly consulted during training.
+                axis.axhline(
+                    value,
+                    color=color,
+                    linestyle="--",
+                    linewidth=1.5,
+                    label=f"Final test / selected checkpoint — {display_name} ({value:.4f})",
+                )
+            axis.set_xlabel("Epoch")
+        else:
+            # When only test metrics exist, an epoch axis has no meaning. Show
+            # one categorical point per final metric instead of a reference line
+            # spanning an artificial 0-to-1 epoch range.
+            test_positions = np.arange(1, len(test_values) + 1)
+            for position, (value, display_name, color) in zip(test_positions, test_values):
+                axis.scatter(
+                    position,
+                    value,
+                    color=color,
+                    marker="D",
+                    s=55,
+                    label=f"{display_name} ({value:.4f})",
+                )
+            axis.set_xticks(test_positions, [item[1] for item in test_values])
+            axis.set_xlabel("Final test evaluation")
+
+        axis.set_ylabel("AUPRC")
+        axis.set_ylim(0.0, 1.02)
+        axis.set_title(title)
+        axis.grid(True, alpha=0.3)
+        axis.legend()
+        figure.tight_layout()
+        figure.savefig(output_path, dpi=160)
+        plt.close(figure)
+        print(f"Saved {title.lower()} plot to {output_path}")
+
+    save_metric_figure(
+        validation_specs=(
+            ("val_interaction_auprc", "Validation Interaction AUPRC", "#D95F02"),
+        ),
+        test_specs=(
+            ("test_interaction_auprc", "Interaction AUPRC", "#7F2704"),
+        ),
+        title="Interaction AUPRC by Epoch",
+        output_path=output_dir / "interaction_auprc_history.png",
+    )
+    save_metric_figure(
+        validation_specs=(
+            ("val_contact_auprc_macro", "Validation Macro AUPRC", "#1B7837"),
+            ("val_contact_auprc_micro", "Validation Micro AUPRC", "#2166AC"),
+        ),
+        test_specs=(
+            ("test_contact_auprc_macro", "Macro AUPRC", "#00441B"),
+            ("test_contact_auprc_micro", "Micro AUPRC", "#053061"),
+        ),
+        title="Contact-map AUPRC by Epoch",
+        output_path=output_dir / "contact_auprc_history.png",
+    )
+
+
 def move_tensor_batch_to_device(batch: dict[str, torch.Tensor], device: torch.device) -> dict[str, torch.Tensor]:
     """Move one DataLoader batch to the device that currently holds the model."""
     return {key: value.to(device) if isinstance(value, torch.Tensor) else value for key, value in batch.items()}
@@ -561,6 +755,13 @@ class FullyConnectedLightningModule(pl.LightningModule):
         self.model = FullyConnectedInteractionModel(input_dim=input_dim, hidden_dim=hidden_dim, dropout=dropout)
         self.learning_rate = learning_rate
 
+        # Average precision (commonly reported as AUPRC) is non-additive, so it
+        # must accumulate probabilities and labels across the complete split.
+        # Validation and test use distinct states to prevent either evaluation
+        # population from leaking into the other.
+        self.val_interaction_auprc = BinaryAveragePrecision()
+        self.test_interaction_auprc = BinaryAveragePrecision()
+
     def forward(self, features: torch.Tensor) -> torch.Tensor:
         """Run a batch through the model and return logits."""
         return self.model(features)
@@ -577,11 +778,25 @@ class FullyConnectedLightningModule(pl.LightningModule):
         loss = (per_example_loss * weights).mean()
 
         # Accuracy is deliberately unweighted so it remains easy to interpret.
-        predictions = (torch.sigmoid(logits) >= INTERACTION_THRESHOLD).float()
+        interaction_probabilities = torch.sigmoid(logits)
+        predictions = (interaction_probabilities >= INTERACTION_THRESHOLD).float()
         accuracy = (predictions == labels).float().mean()
 
         self.log(f"{stage}_loss", loss, prog_bar=True, on_step=False, on_epoch=True, batch_size=labels.size(0))
         self.log(f"{stage}_accuracy", accuracy, prog_bar=True, on_step=False, on_epoch=True, batch_size=labels.size(0))
+
+        if stage in ("val", "test"):
+            # Loss weights rebalance optimization only. AUPRC describes the
+            # natural split population and therefore uses unweighted examples.
+            interaction_auprc = getattr(self, f"{stage}_interaction_auprc")
+            interaction_auprc.update(interaction_probabilities, labels.to(torch.long))
+            self.log(
+                f"{stage}_interaction_auprc",
+                interaction_auprc,
+                prog_bar=True,
+                on_step=False,
+                on_epoch=True,
+            )
 
         if stage == "test":
             log_test_accuracy_by_dimer_type(self, batch["dimer_type_index"], predictions, labels)
@@ -646,6 +861,10 @@ class DScriptDataset(Dataset):
             "embedding_1": embedding_1,
             "embedding_2": embedding_2,
             "contact_map": contact_map,
+            # This flag distinguishes measured structural maps from optional
+            # all-zero maps fabricated for negative-example training. Only the
+            # former define a valid contact-map evaluation population.
+            "has_true_contact_map": torch.tensor(contact_map is not None, dtype=torch.bool),
             "label": torch.tensor(float(row.label), dtype=torch.float32),
             "loss_weight": torch.tensor(float(row.loss_weight), dtype=torch.float32),
             "dimer_type_index": torch.tensor(DIMER_TYPE_TO_INDEX.get(row.dimer_type, -1), dtype=torch.long),
@@ -755,6 +974,7 @@ def collate_dscript_batch(items: list[dict[str, object]], negative_contact_maps:
         "label": torch.stack([item["label"] for item in items]),
         "loss_weight": torch.stack([item["loss_weight"] for item in items]),
         "dimer_type_index": torch.stack([item["dimer_type_index"] for item in items]),
+        "has_true_contact_map": torch.stack([item["has_true_contact_map"] for item in items]),
     }
 
 
@@ -950,6 +1170,18 @@ class DScriptLightningModule(pl.LightningModule):
         self.loss_type = loss_type
         self.omega = omega
 
+        # Pair-level AUPRC is exact because validation/test contain only about a
+        # thousand examples. Contact evaluation is split into two complementary
+        # views: exact macro AP gives every structural complex equal weight,
+        # while streaming micro AP pools known residue pairs without retaining
+        # tens of millions of predictions in memory.
+        self.val_interaction_auprc = BinaryAveragePrecision()
+        self.test_interaction_auprc = BinaryAveragePrecision()
+        self.val_contact_auprc_macro = MacroContactAveragePrecision()
+        self.test_contact_auprc_macro = MacroContactAveragePrecision()
+        self.val_contact_auprc_micro = BinnedBinaryAveragePrecision()
+        self.test_contact_auprc_micro = BinnedBinaryAveragePrecision()
+
     def forward(
         self,
         embedding_1: torch.Tensor,
@@ -1044,7 +1276,8 @@ class DScriptLightningModule(pl.LightningModule):
 
         # Interaction classification uses the same probability cutoff as the
         # prediction export, so reported accuracy and saved labels agree.
-        interaction_predictions = (torch.sigmoid(interaction_logits) >= INTERACTION_THRESHOLD).float()
+        interaction_probabilities = torch.sigmoid(interaction_logits)
+        interaction_predictions = (interaction_probabilities >= INTERACTION_THRESHOLD).float()
         interaction_accuracy = (interaction_predictions == labels).float().mean()
 
         batch_size = labels.size(0)
@@ -1118,6 +1351,15 @@ class DScriptLightningModule(pl.LightningModule):
             batch_size=batch_size,
         )
 
+        if stage in ("val", "test"):
+            self.update_and_log_auprc_metrics(
+                stage,
+                interaction_probabilities,
+                labels,
+                contact_probabilities,
+                batch,
+            )
+
         if contact_metrics["known_contacts"] > 0:
             self.log_contact_metrics(stage, contact_metrics, batch_size)
 
@@ -1125,6 +1367,68 @@ class DScriptLightningModule(pl.LightningModule):
             log_test_accuracy_by_dimer_type(self, batch["dimer_type_index"], interaction_predictions, labels)
 
         return optimization_loss
+
+    def update_and_log_auprc_metrics(
+        self,
+        stage: str,
+        interaction_probabilities: torch.Tensor,
+        interaction_labels: torch.Tensor,
+        contact_probabilities: torch.Tensor,
+        batch: dict[str, torch.Tensor],
+    ) -> None:
+        """Update split-wide interaction and structural contact AUPRC states.
+
+        Interaction AUPRC ranks complete protein pairs. Contact macro AUPRC
+        computes one AP per true structural map and then weights maps equally;
+        contact micro AUPRC pools all known residue pairs and consequently gives
+        larger maps more weight. The two contact summaries intentionally exclude
+        synthetic negative maps, even when those maps are enabled for training.
+        """
+        interaction_metric = getattr(self, f"{stage}_interaction_auprc")
+        interaction_metric.update(interaction_probabilities, interaction_labels.to(torch.long))
+        self.log(
+            f"{stage}_interaction_auprc",
+            interaction_metric,
+            prog_bar=True,
+            on_step=False,
+            on_epoch=True,
+        )
+
+        true_contact_map = batch["contact_map"]
+        has_true_contact_map = batch["has_true_contact_map"]
+
+        # Unknown/unresolved and padded cells remain -1 and cannot enter either
+        # PR curve. Expanding the per-example structural flag across both map
+        # dimensions also removes optional synthetic all-zero negative maps.
+        contact_evaluation_mask = (true_contact_map >= 0) & has_true_contact_map[:, None, None]
+
+        macro_metric = getattr(self, f"{stage}_contact_auprc_macro")
+        macro_metric.update(
+            contact_probabilities,
+            true_contact_map,
+            true_contact_map >= 0,
+            has_true_contact_map,
+        )
+        self.log(
+            f"{stage}_contact_auprc_macro",
+            macro_metric,
+            prog_bar=True,
+            on_step=False,
+            on_epoch=True,
+        )
+
+        micro_metric = getattr(self, f"{stage}_contact_auprc_micro")
+        micro_metric.update(
+            contact_probabilities[contact_evaluation_mask],
+            true_contact_map[contact_evaluation_mask].to(torch.long),
+        )
+        self.log(
+            f"{stage}_contact_auprc_micro",
+            micro_metric,
+            prog_bar=False,
+            on_step=False,
+            on_epoch=True,
+        )
 
     def compute_contact_loss_and_metrics(
         self,
@@ -2087,7 +2391,10 @@ def main() -> None:
         prediction_model.to(trainer.strategy.root_device)
 
     csv_logger.save()
-    save_loss_plot(Path(csv_logger.log_dir) / "metrics.csv", args.output_dir / args.output_subdir / "loss_curve.png")
+    metrics_path = Path(csv_logger.log_dir) / "metrics.csv"
+    run_output_dir = args.output_dir / args.output_subdir
+    save_loss_plot(metrics_path, run_output_dir / "loss_curve.png")
+    save_auprc_plots(metrics_path, run_output_dir)
     save_prediction_table(data_module, prediction_model, args.output_dir / args.output_subdir / "test_predictions.tsv")
     save_test_contact_map_samples(data_module, prediction_model, args.output_dir / args.output_subdir / "contact_maps")
 

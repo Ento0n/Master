@@ -28,5 +28,5 @@ python -m scripts.training_pipeline.execute_pipeline \
   --model query_patch \
   --int-mod-type max \
   --loss-type balanced_bce \
-  --max-epochs 2 \
+  --max-epochs 80 \
   "${output_subdir_args[@]}" \
