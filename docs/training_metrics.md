@@ -65,10 +65,12 @@ omitted when their corresponding class is absent.
 | `{stage}_interface_mask_negative_mean` | no | no | yes | train, val, test |
 | `{stage}_query_gate_scale` | no | no | yes | train, val, test |
 | `{stage}_query_gate_bias` | no | no | yes | train, val, test |
-| `best_val_loss` | yes | yes | yes | once after fitting; W&B only |
+| `best_val_loss` | yes | no | no | once after fitting; W&B only |
+| `best_val_contact_auprc_macro` | no | yes | yes | once after fitting; W&B only |
 
 When all conditional keys are present, the model families produce the following
-number of project-defined metric keys, including `best_val_loss`:
+number of project-defined metric keys, including the model family's `best_*`
+selection metric:
 
 | Model | Number of keys |
 |---|---:|
@@ -149,7 +151,7 @@ The fully connected model does not log a separate `interaction_loss`; its
 
 ### `{stage}_loss`
 
-This name intentionally provides a model-independent checkpoint and sweep metric.
+This name provides a shared differentiable task objective.
 
 For the fully connected model:
 
@@ -172,20 +174,30 @@ Query-patch auxiliary losses are deliberately excluded from `{stage}_loss`, even
 though they participate in optimization. Ordinary batch values are aggregated
 with the full protein-pair batch size. Lower is better.
 
-`val_loss` is especially important: it drives best-checkpoint selection, early
-stopping, and the D-SCRIPT/query-patch learning-rate scheduler. Query-patch model
-selection therefore uses the shared task loss, not `val_optimization_loss`.
+For D-SCRIPT and query patch, `val_loss` drives the learning-rate scheduler.
+Checkpointing and early stopping instead maximize
+`val_contact_auprc_macro`. The fully connected model continues to minimize
+`val_loss` for checkpointing and early stopping.
 
 ### `best_val_loss`
 
-The lowest checkpoint-monitored `val_loss` observed during fitting. It is logged
-once after training at the final global step and is the objective minimized by
-the W&B sweep configurations.
+For the fully connected model, this is the lowest checkpoint-monitored
+`val_loss` observed during fitting. It is logged once after training at the
+final global step.
 
 This is the selected checkpoint's validation score, not necessarily the last
 epoch's `val_loss`. Lower is better. Unlike all `self.log` metrics,
 `best_val_loss` is sent directly to W&B and is not written to the CSV metrics
 file.
+
+### `best_val_contact_auprc_macro`
+
+For D-SCRIPT and query patch, this is the highest
+`val_contact_auprc_macro` observed during fitting. It is used for checkpoint
+selection, early stopping, and W&B contact-model sweeps.
+
+This value is logged once after training at the final global step. Higher is
+better. It is sent directly to W&B and is not written to the CSV metrics file.
 
 ## Contact-map population and masking
 
@@ -413,9 +425,12 @@ An interface target is defined separately for each protein chain:
 ### `{stage}_interface_mask_loss`
 
 Class-balanced BCE between the predicted chain-wise interface logits and the
-interface targets. The balanced loss is computed for each chain using the same
-`omega` convention as `balanced_bce`, then the two chain losses are averaged.
-The epoch mean is weighted by the number of supervised maps. Lower is better.
+interface targets. The balanced loss is computed for each chain using
+`--interface-omega` (default `0.2`) as the positive-class weight and
+`1 - interface_omega` as the negative-class weight, then the two chain losses
+are averaged. This is independent of `--omega`, which controls the final and
+compatibility contact-map BCEs. The epoch mean is weighted by the number of
+supervised maps. Lower is better.
 
 ### `{stage}_interface_mask_weighted_loss`
 
@@ -550,8 +565,8 @@ probabilities; it is an output table rather than an aggregate metric.
 - Use contact precision and recall to understand behavior at the configured
   threshold, but remember their epoch aggregation and sensitivity to that
   threshold.
-- Use `val_loss`/`best_val_loss` to reproduce the current checkpoint and sweep
-  selection behavior. Do not compare `contact_loss` across different loss types.
+- For D-SCRIPT and query patch, use `best_val_contact_auprc_macro` for checkpoint
+  and sweep selection. Do not compare `contact_loss` across different loss types.
 - For query patch, use `optimization_loss` to understand the full optimized
   objective and the interface/compatibility metrics to diagnose which branch is
   improving or collapsing.

@@ -54,7 +54,7 @@ DEFAULT_CONTACT_MAP_DIR = Path("/nfs/scratch/pdb_dimers/contact_maps/data")
 DEFAULT_OUTPUT_DIR = Path("/nfs/home/students/a.spannagl/master_repository/jobs/training_pipeline/results")
 CONTACT_MAP_SAMPLE_COUNT = 5
 
-MONITOR = "val_loss"
+MONITOR = "val_contact_auprc_macro"
 
 
 def parse_args() -> argparse.Namespace:
@@ -119,7 +119,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--num-interaction-queries",
         type=int,
-        default=32,
+        default=4,
         help="Number of learned interface-patch queries for the query_patch model.",
     )
     parser.add_argument(
@@ -161,6 +161,12 @@ def parse_args() -> argparse.Namespace:
         help="Auxiliary balanced-BCE weight for chain-wise query interface masks.",
     )
     parser.add_argument(
+        "--interface-omega",
+        type=float,
+        default=0.2, # Around 20% of residues are interface residues
+        help="Positive-class weight for the chain-wise query interface balanced BCE.",
+    )
+    parser.add_argument(
         "--interaction-loss-lambda",
         type=float,
         default=0.5,
@@ -193,7 +199,12 @@ def parse_args() -> argparse.Namespace:
         type=str, 
         choices=("contact", "sparsity_11", "sparsity_12", "sparsity_21", "sparsity_22", "balanced_bce", "balanced_bce_dice"), 
         help="Which loss type to apply for the contact map")
-    parser.add_argument("--omega", default=0.5, type=float, help="Weighting of positive and negative class of balanced BCE")
+    parser.add_argument(
+        "--omega",
+        default=0.5,
+        type=float,
+        help="Positive-class weight for final and compatibility contact-map balanced BCEs.",
+    )
     parser.add_argument("--int-mod-type", default="normal", type=str, choices=("normal", "max"), help="Which loss type to apply for the contact map, choices: normal, max")
     parser.add_argument("--trainable-final-slope", action="store_true", help="DScript Interaction module slope applied.")
     parser.add_argument("--gamma-init", type=float, default=0.0, help="DScript gamma parameter of interaction module, (gamma*variance)-mean as threshold of high contacts.")
@@ -227,7 +238,9 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--contact-width must be a positive odd integer")
 
     if not 0.0 <= args.omega <= 1.0:
-        raise ValueError("--omega must be 1, 0 or in [0, 1]")
+        raise ValueError("--omega must be in [0, 1]")
+    if not 0.0 <= args.interface_omega <= 1.0:
+        raise ValueError("--interface-omega must be in [0, 1]")
 
     # Query-patch attention operates in the projected residue dimension. Multi-
     # head attention splits that dimension evenly across heads, and at least one
@@ -1675,7 +1688,7 @@ class DScriptLightningModule(pl.LightningModule):
             "optimizer": optimizer,
             "lr_scheduler": {
                 "scheduler": scheduler,
-                "monitor": MONITOR,
+                "monitor": "val_loss",
                 "interval": "epoch",
                 "frequency": 1,
             },
@@ -1735,6 +1748,7 @@ class QueryPatchLightningModule(DScriptLightningModule):
         compatibility_rank: int = 32,
         compatibility_scale: float = 2,
         omega: float = 0.5,
+        interface_omega: float = 0.2,
     ) -> None:
         super().__init__(
             embedding_dim=embedding_dim,
@@ -1756,6 +1770,7 @@ class QueryPatchLightningModule(DScriptLightningModule):
         # Retain the old constructor/CLI name as an alias so existing sweep
         # configurations keep working after the objective changes meaning.
         self.query_interface_loss_weight = query_gate_loss_weight
+        self.interface_omega = interface_omega
         self.model = QueryPatchInteractionModel(
             embedding_dim=embedding_dim,
             projection_dim=projection_dim,
@@ -1795,19 +1810,21 @@ class QueryPatchLightningModule(DScriptLightningModule):
         interface_targets_2 = contact_mask.any(dim=1).to(true_contact_map.dtype)
         # [B, L1] & [B, L2]
 
+        # Interface residues are substantially denser than residue-pair contacts,
+        # so their class balance is configured independently from contact omega.
         interface_logits_1 = contact_aux["interface_logits_1"]
         interface_logits_2 = contact_aux["interface_logits_2"]
         interface_loss_1 = balanced_binary_cross_entropy_per_map(
             interface_logits_1,
             interface_targets_1,
             known_interface_1,
-            self.omega,
+            self.interface_omega,
         )
         interface_loss_2 = balanced_binary_cross_entropy_per_map(
             interface_logits_2,
             interface_targets_2,
             known_interface_2,
-            self.omega,
+            self.interface_omega,
         )
         interface_loss = 0.5 * (interface_loss_1 + interface_loss_2)
         weighted_interface_loss = self.query_interface_loss_weight * interface_loss
@@ -1939,6 +1956,7 @@ def build_data_module_and_model(
             query_contact_bias_init=args.query_contact_bias_init,
             query_gate_bias_init=args.query_gate_bias_init,
             query_gate_loss_weight=args.query_gate_loss_weight,
+            interface_omega=args.interface_omega,
             compatibility_rank=args.compatibility_rank,
             compatibility_scale=args.compatibility_scale,
         )
@@ -2286,6 +2304,7 @@ def main() -> None:
                         f"qbias={args.query_contact_bias_init}",
                         f"qgbias={args.query_gate_bias_init}",
                         f"qifw={args.query_gate_loss_weight}",
+                        f"ifomega={args.interface_omega}",
                         f"rank={args.compatibility_rank}",
                         f"scale={args.compatibility_scale}",
                     )
@@ -2325,14 +2344,16 @@ def main() -> None:
     data_module.setup("fit")
 
     has_validation = data_module.val_dataset is not None and len(data_module.val_dataset) > 0
+    selection_monitor = "val_loss" if args.model == "fully_connected" else MONITOR
+    selection_mode = "min" if args.model == "fully_connected" else "max"
     if has_validation:
-        # With validation data, keep the checkpoint with the lowest validation
-        # loss and also save "last" for resuming/debugging.
+        # Keep the checkpoint with the best validation metric and also save
+        # "last" for resuming/debugging.
         checkpoint_callback = ModelCheckpoint(
             dirpath=args.output_dir / args.output_subdir / "checkpoints",
-            filename=f"{args.model}" + "-{epoch:02d}-{val_loss:.4f}",
-            monitor=MONITOR,
-            mode="min",
+            filename=f"{args.model}-{{epoch:02d}}-{{{selection_monitor}:.4f}}",
+            monitor=selection_monitor,
+            mode=selection_mode,
             save_top_k=1,
             save_last=True,
         )
@@ -2347,8 +2368,8 @@ def main() -> None:
         )
     
     early_stopping = EarlyStopping(
-        monitor=MONITOR,
-        mode="min",
+        monitor=selection_monitor,
+        mode=selection_mode,
         patience=5,
         min_delta=0.01,
         verbose=True
@@ -2372,7 +2393,7 @@ def main() -> None:
     best_score = checkpoint_callback.best_model_score.detach().cpu().item()
 
     wandb_logger.log_metrics(
-        {"best_" + MONITOR: best_score},
+        {"best_" + selection_monitor: best_score},
         step=trainer.global_step,
     )
 

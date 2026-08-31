@@ -5,8 +5,8 @@ project: master
 method: grid
 
 metric:
-  name: best_val_loss
-  goal: minimize
+  name: best_val_contact_auprc_macro
+  goal: maximize
 
 parameters:
   model:
@@ -15,14 +15,17 @@ parameters:
   loss-type:
     value: balanced_bce
 
-  query-gate-loss-weight:
-    values: [0.0, 0.05, 0.2, 0.5]
+  query-interface-loss-weight:
+    values: [0.0, 0.05, 0.2, 0.5, 1.0]
 
-  query-gate-bias-init:
-    values: [-2.0, 0.0]
+  interface-omega:
+    value: 0.2
+
+  omega:
+    values: [0.02, 0.05, 0.1, 0.2, 0.5]
   
   max-epochs:
-    value: 92
+    value: 91
 
 command:
   - ${env}

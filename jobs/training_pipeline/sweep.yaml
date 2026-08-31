@@ -5,8 +5,8 @@ project: master
 method: bayes
 
 metric:
-  name: best_val_loss
-  goal: minimize
+  name: best_val_contact_auprc_macro
+  goal: maximize
 
 parameters:
   model:
