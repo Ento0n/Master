@@ -11,4 +11,4 @@
 #SBATCH --mail-type=END,FAIL                        # Mail events (NONE, BEGIN, END, FAIL, ALL)
 #SBATCH --mail-user=antspa@gmx.de                   # Where to send mail
 
-python /nfs/home/students/a.spannagl/master_repository/scripts/data_pipeline/13_sample_negatives.py --input /nfs/scratch/pdb_dimers/final_final_filtered_interactions_with_partitions_cd_hit.tsv --output /nfs/scratch/pdb_dimers/balanced_interactions_keep_homomers_cd_hit.tsv --keep-positive-homomers
+python /nfs/home/students/a.spannagl/master_repository/scripts/data_pipeline/13_sample_negatives.py --input /nfs/scratch/pdb_dimers/dataset_iterations/07_cdhit.tsv --output /nfs/scratch/pdb_dimers/final_datasets/balanced_interactions_keep_homomers_cd_hit.tsv --keep-positive-homomers

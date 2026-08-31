@@ -12,6 +12,6 @@
 #SBATCH --mail-user=antspa@gmx.de                   # Where to send mail
 
 python /nfs/home/students/a.spannagl/master_repository/scripts/data_pipeline/10_generate_contact_maps.py \
-    --selection-tsv /nfs/scratch/pdb_dimers/final_filtered_interactions_with_partitions.tsv \
+    --selection-tsv /nfs/scratch/pdb_dimers/dataset_iterations/05_KaHIP_partitions.tsv \
     --input-dir /nfs/scratch/pdb_dimers/assemblies \
     --output-dir /nfs/scratch/pdb_dimers/contact_maps
