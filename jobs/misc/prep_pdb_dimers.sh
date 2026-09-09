@@ -1,0 +1,14 @@
+#!/bin/bash
+#
+#SBATCH --job-name=prep_pdb_dimers              # Job name
+#SBATCH --output=logs/prep_pdb_dimers.%j.out    # Standard output (%j expands to jobId)
+#SBATCH --error=logs/prep_pdb_dimers.%j.err     # Standard error
+#SBATCH --partition=shared-cpu                                   # not standard otherwise no permissions
+#SBATCH --ntasks=1                                               # Run a single task
+#SBATCH --cpus-per-task=1                           # Number of CPU cores per task
+#SBATCH --mem=16G                                   # Total memory
+#SBATCH --time=4-00:00:00                           # Time limit hh:mm:ss
+#SBATCH --mail-type=END,FAIL                        # Mail events (NONE, BEGIN, END, FAIL, ALL)
+#SBATCH --mail-user=antspa@gmx.de                   # Where to send mail
+
+python /nfs/home/students/a.spannagl/master_repository/scripts/misc/prep_pdb_dimers.py --outdir /nfs/scratch/pdb_dimers/prep_pdb_dimers_again --limit 1000
