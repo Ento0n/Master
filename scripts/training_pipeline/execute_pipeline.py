@@ -8,6 +8,7 @@ interaction labels and available residue contact maps.
 from __future__ import annotations
 
 import argparse
+import hashlib
 from pathlib import Path
 from functools import partial
 
@@ -147,10 +148,20 @@ def parse_args() -> argparse.Namespace:
         help="Initial background contact logit of the compatibility branch.",
     )
     parser.add_argument(
+        "--query-evidence-mode",
+        choices=("gated", "additive"),
+        default="gated",
+        help=(
+            "How query_patch combines query and compatibility evidence: 'gated' "
+            "uses multiplicative gating and branch supervision; 'additive' "
+            "restores the original summed logits with only the main task losses."
+        ),
+    )
+    parser.add_argument(
         "--query-gate-bias-init",
         type=float,
         default=0.0,
-        help="Initial logit bias of the query-patch compatibility gate.",
+        help="Initial logit bias of the query-patch compatibility gate (gated mode only).",
     )
     parser.add_argument(
         "--query-interface-loss-weight",
@@ -158,13 +169,13 @@ def parse_args() -> argparse.Namespace:
         dest="query_gate_loss_weight",
         type=float,
         default=0.2,
-        help="Auxiliary balanced-BCE weight for chain-wise query interface masks.",
+        help="Auxiliary balanced-BCE weight for chain-wise query interface masks (gated mode only).",
     )
     parser.add_argument(
         "--interface-omega",
         type=float,
         default=0.2, # Around 20% of residues are interface residues
-        help="Positive-class weight for the chain-wise query interface balanced BCE.",
+        help="Positive-class weight for the chain-wise query interface balanced BCE (gated mode only).",
     )
     parser.add_argument(
         "--interaction-loss-lambda",
@@ -1759,6 +1770,7 @@ class QueryPatchLightningModule(DScriptLightningModule):
         omega: float = 0.5,
         interface_omega: float = 0.2,
         compatibility_head: str = "bilinear",
+        query_evidence_mode: str = "gated",
     ) -> None:
         super().__init__(
             embedding_dim=embedding_dim,
@@ -1781,6 +1793,9 @@ class QueryPatchLightningModule(DScriptLightningModule):
         # configurations keep working after the objective changes meaning.
         self.query_interface_loss_weight = query_gate_loss_weight
         self.interface_omega = interface_omega
+        # The saved mode selects both the contact-logit formula and its training
+        # objective when Lightning reconstructs the model from a checkpoint.
+        self.query_evidence_mode = query_evidence_mode
         self.model = QueryPatchInteractionModel(
             embedding_dim=embedding_dim,
             projection_dim=projection_dim,
@@ -1800,6 +1815,7 @@ class QueryPatchLightningModule(DScriptLightningModule):
             compatibility_rank=compatibility_rank,
             compatibility_scale=compatibility_scale,
             compatibility_head=compatibility_head,
+            query_evidence_mode=query_evidence_mode,
         )
 
     def compute_auxiliary_contact_loss(
@@ -1807,7 +1823,13 @@ class QueryPatchLightningModule(DScriptLightningModule):
         contact_aux: dict[str, torch.Tensor],
         batch: dict[str, torch.Tensor],
     ) -> tuple[torch.Tensor, dict[str, tuple[torch.Tensor, int]]]:
-        """Train query masks on interfaces and compatibility on pair contacts."""
+        """Apply branch supervision only to the gated query-patch variant."""
+        # The original additive formulation learns both branches through the
+        # final contact and interaction losses; it has no interface/gate targets
+        # or separate compatibility BCE. Return a device/dtype-matched scalar.
+        if self.query_evidence_mode == "additive":
+            return batch["label"].new_zeros(()), {}
+
         true_contact_map = batch["contact_map"]
         known_mask = true_contact_map >= 0
 
@@ -1971,6 +1993,7 @@ def build_data_module_and_model(
             compatibility_rank=args.compatibility_rank,
             compatibility_scale=args.compatibility_scale,
             compatibility_head=args.compatibility_head,
+            query_evidence_mode=args.query_evidence_mode,
         )
     else:
         model = DScriptLightningModule(**model_options)
@@ -2314,12 +2337,20 @@ def main() -> None:
                         f"ql={args.query_layers}",
                         f"qdrop={args.query_dropout}",
                         f"qbias={args.query_contact_bias_init}",
-                        f"qgbias={args.query_gate_bias_init}",
-                        f"qifw={args.query_gate_loss_weight}",
-                        f"ifomega={args.interface_omega}",
+                        f"qev={args.query_evidence_mode}",
                         f"compat={args.compatibility_head}",
                     )
                 )
+                # Additive runs have no gate or auxiliary branch supervision,
+                # so those inactive options must not identify distinct runs.
+                if args.query_evidence_mode == "gated":
+                    output_name_parts.extend(
+                        (
+                            f"qgbias={args.query_gate_bias_init}",
+                            f"qifw={args.query_gate_loss_weight}",
+                            f"ifomega={args.interface_omega}",
+                        )
+                    )
                 if args.compatibility_head == "bilinear":
                     output_name_parts.extend(
                         (
@@ -2349,6 +2380,14 @@ def main() -> None:
             )
         output_name_parts.append(f"omega={args.omega}")
         args.output_subdir = "_".join(output_name_parts)
+        # Generated names contain only ASCII choices/numbers. Long sweep float
+        # values can exceed the filesystem's 255-byte component limit; retain a
+        # readable prefix and hash the full name so truncated settings still
+        # distinguish runs. Explicit --output-subdir values are left untouched.
+        encoded_name = args.output_subdir.encode("ascii")
+        if len(encoded_name) > 255:
+            name_digest = hashlib.sha256(encoded_name).hexdigest()[:16]
+            args.output_subdir = f"{args.output_subdir[:238]}_{name_digest}"
 
     # Set pytorch lightning seed & set up tensor cores
     pl.seed_everything(42)

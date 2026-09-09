@@ -1,6 +1,6 @@
 # Query-Patch Model History and Sweep Index
 
-Last reviewed: 2026-08-31
+Last reviewed: 2026-09-09
 
 This document records how the query-patch model evolved and maps each experimental
 stage to the `max_epochs` value used to identify its artifacts under
@@ -8,11 +8,60 @@ stage to the `max_epochs` value used to identify its artifacts under
 architecture, training objectives, evaluation changes, and the sweeps used to test
 them.
 
+## Selecting the Final Model Variants
+
+The [thesis](https://sharelatex.tum.de/read/xywkwfhfxsfc) variants are selectable
+through the training CLI. All four support either `--int-mod-type normal` or
+`--int-mod-type max` for interaction prediction.
+
+| Thesis variant | CLI settings |
+|---|---|
+| D-SCRIPT | `--model dscript` |
+| QP-Additive | `--model query_patch --query-evidence-mode additive --compatibility-head bilinear` |
+| QP-Bilin-IC | `--model query_patch --query-evidence-mode gated --compatibility-head bilinear` |
+| QP-Conv-IC | `--model query_patch --query-evidence-mode gated --compatibility-head dscript` |
+
+For example, run QP-Additive with balanced contact BCE and max interaction pooling:
+
+```bash
+python -m scripts.training_pipeline.execute_pipeline \
+    --model query_patch \
+    --query-evidence-mode additive \
+    --compatibility-head bilinear \
+    --compatibility-scale 2 \
+    --loss-type balanced_bce \
+    --int-mod-type max \
+    --max-epochs 100
+```
+
+`--query-evidence-mode` defaults to `gated`, preserving the current calculation.
+`additive` restores the fixed, normalized formulation from stage 3 below:
+`contact_logits = query_evidence + scale * compatibility_evidence + contact_bias`.
+It uses the main interaction/contact objectives only: both auxiliary interface
+and standalone compatibility losses are disabled, and gate-bias/interface-loss
+settings have no effect. The bilinear scale stays fixed; scale `0` gives the
+query-only ablation. Both query and compatibility branches still receive gradients
+through the final contact logits.
+
+The mode can also be set in a W&B sweep using `query-evidence-mode` as the
+parameter name. Checkpoints save the mode, and automatically generated result
+directories include `qev=additive` or `qev=gated`. Names exceeding the filesystem's
+255-byte limit are shortened with a hash of the full name so long sweep values
+still identify distinct runs. Existing gated checkpoints without this setting
+still load as gated. When explicitly loading an older
+additive Lightning checkpoint, pass `query_evidence_mode="additive"` to
+`QueryPatchLightningModule.load_from_checkpoint(...)`.
+
+Additive combination also supports `--compatibility-head dscript` as an additional
+ablation, but that combination is not the thesis's historical QP-Additive model.
+The convolutional head does not use `--compatibility-rank` or
+`--compatibility-scale`.
+
 ## Current Model at a Glance
 
 The query-patch model reuses the D-SCRIPT residue projection and interaction-pooling
 heads, but replaces the D-SCRIPT contact-map generator with learned query patches.
-For one protein pair, the committed design is:
+For one protein pair, the default gated design is:
 
 1. Project both proteins' residue embeddings with the shared D-SCRIPT projection.
 2. Let learned queries attend jointly to the two projected proteins.

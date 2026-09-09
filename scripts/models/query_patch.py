@@ -6,14 +6,18 @@ Data flow for one protein pair:
         -> shared D-SCRIPT projection
         -> learned queries attend to both projected proteins
         -> each query predicts one mask on each protein and a patch strength
-        -> matched query patches form a soft gate over residue pairs
-        -> compatibility proposes contacts only where that gate is open
+        -> matched query patches form residue-pair query evidence
+        -> gate compatibility probabilities (default), or add both logit evidences
         -> the existing D-SCRIPT normal or max interaction head pools that map
 
 The transformer never receives structural annotation masks. ``mask_1`` and
 ``mask_2`` identify real sequence residues versus batch padding only. Unknown
 contact-map cells (target value -1) remain a loss/metric concern in the training
 pipeline and must not influence attention or interaction pooling.
+
+``query_evidence_mode="additive"`` restores QP-Additive: query evidence plus
+compatibility logits, including the contact bias once. Its training wrapper uses
+only the main contact/interaction losses; gated mode also has branch supervision.
 """
 
 from __future__ import annotations
@@ -50,6 +54,7 @@ class QueryPatchContactModule(nn.Module):
         compatibility_head: str = "bilinear",
         contact_hidden_dim: int = 50,
         contact_width: int = 7,
+        query_evidence_mode: str = "gated",
     ) -> None:
         super().__init__()
         if projection_dim <= 0:
@@ -66,9 +71,12 @@ class QueryPatchContactModule(nn.Module):
             raise ValueError(
                 "compatibility_head must be either 'bilinear' or 'dscript'"
             )
+        if query_evidence_mode not in {"gated", "additive"}:
+            raise ValueError("query_evidence_mode must be either 'gated' or 'additive'")
 
         self.projection_dim = projection_dim
         self.num_queries = num_queries
+        self.query_evidence_mode = query_evidence_mode
 
         # The K vectors are model parameters shared by all protein pairs. They
         # start as distinct random slots and become generic interface-search
@@ -108,19 +116,23 @@ class QueryPatchContactModule(nn.Module):
         nn.init.eye_(self.query_mask_projection.weight)
         nn.init.eye_(self.residue_mask_projection.weight)
 
-        # Each query contributes a non-negative gate patch. A negative initial
-        # strength keeps those patches modest, while contact_bias is the sparse
-        # background logit of the separate compatibility contact branch.
+        # Each query contributes a non-negative patch. A negative initial
+        # strength keeps those patches modest. The sparse background contact
+        # bias belongs to compatibility logits and is used once in either mode.
         self.patch_strength = nn.Linear(projection_dim, 1)
         nn.init.constant_(self.patch_strength.bias, -2.0)
         self.contact_bias = nn.Parameter(torch.tensor(float(contact_bias_init)))
 
-        # Query evidence is non-negative, so a positive learned scale preserves
-        # the interpretation that stronger matched patches open the gate. The
-        # raw value is initialized so softplus(raw_scale) is exactly one.
-        initial_raw_scale = math.log(math.expm1(1.0))
-        self.query_gate_raw_scale = nn.Parameter(torch.tensor(initial_raw_scale))
-        self.query_gate_bias = nn.Parameter(torch.tensor(float(query_gate_bias_init)))
+        # Only gated mode learns a gate scale/bias. Additive mode uses raw query
+        # evidence, as in QP-Additive, and has no inactive gate parameters in its
+        # optimizer or state dict. Gated checkpoint parameter names stay intact.
+        if query_evidence_mode == "gated":
+            initial_raw_scale = math.log(math.expm1(1.0))
+            self.query_gate_raw_scale = nn.Parameter(torch.tensor(initial_raw_scale))
+            self.query_gate_bias = nn.Parameter(torch.tensor(float(query_gate_bias_init)))
+        else:
+            self.register_parameter("query_gate_raw_scale", None)
+            self.register_parameter("query_gate_bias", None)
 
         # Construct only the selected compatibility head. This keeps old
         # bilinear checkpoints unchanged and avoids adding inactive parameters
@@ -169,7 +181,7 @@ class QueryPatchContactModule(nn.Module):
             torch.Tensor,
             torch.Tensor,
             torch.Tensor,
-            torch.Tensor,
+            torch.Tensor | None,
             torch.Tensor,
             torch.Tensor,
             torch.Tensor,
@@ -183,6 +195,7 @@ class QueryPatchContactModule(nn.Module):
         ``[B,K,L1]``/``[B,K,L2]``, strengths ``[B,K]``, query evidence
         ``[B,L1,L2]``, gate logits ``[B,L1,L2]``, compatibility logits
         ``[B,L1,L2]``, and chain-wise interface logits ``[B,L1]``/``[B,L2]``.
+        The gate-logit entry is ``None`` in additive mode because no gate exists.
         """
         if projected_1.ndim != 3 or projected_2.ndim != 3:
             raise ValueError("projected residue tensors must be shaped [batch, residues, projection_dim]")
@@ -248,7 +261,7 @@ class QueryPatchContactModule(nn.Module):
         patch_strengths = F.softplus(self.patch_strength(query_states).squeeze(-1))
 
         # A^T diag(strength) B composes K rank-one patches into one [B,L1,L2]
-        # gate-evidence tensor. Scaling keeps its initial magnitude comparable
+        # evidence tensor. Scaling keeps its initial magnitude comparable
         # when num_queries changes.
         weighted_masks_1 = patch_masks_1 * patch_strengths[:, :, None]
         query_evidence = torch.bmm(weighted_masks_1.transpose(1, 2), patch_masks_2)
@@ -259,8 +272,8 @@ class QueryPatchContactModule(nn.Module):
 
         query_evidence = query_evidence.masked_fill(~pair_mask, 0.0)
 
-        # Both alternatives return one compatibility logit per residue pair.
-        # The query gate remains independent and is applied only afterward.
+        # Both heads return one compatibility logit per residue pair, including
+        # the background bias. Query evidence is combined with it afterward.
         if self.compatibility_head == "bilinear":
             normalized_1 = self.compatibility_norm(projected_1)
             normalized_2 = self.compatibility_norm(projected_2)
@@ -299,22 +312,31 @@ class QueryPatchContactModule(nn.Module):
                 + self.contact_bias
             )
 
-        ### Use query patches as a soft prerequisite for compatibility
-        gate_scale = F.softplus(self.query_gate_raw_scale)
-        query_gate_logits = gate_scale * query_evidence + self.query_gate_bias
+        # =====================================================================
+        # Evidence combination: historical additive logits or gated probability
+        # =====================================================================
+        if self.query_evidence_mode == "additive":
+            # QP-Additive: E_query + alpha * E_compatibility + contact_bias.
+            # Compatibility logits already contain the scale and bias. Query
+            # evidence receives no learned gate scale, bias, or extra sigmoid.
+            contact_logits = query_evidence + compatibility_contact_logits
+            query_gate_logits = None
+        else:
+            # Query evidence is non-negative; a positive learned scale preserves
+            # the interpretation that stronger matched patches open the gate.
+            gate_scale = F.softplus(self.query_gate_raw_scale)
+            query_gate_logits = gate_scale * query_evidence + self.query_gate_bias
 
-        # The final contact probability is exactly
-        #   sigmoid(query_gate_logits) * sigmoid(compatibility_contact_logits).
-        # Converting this product back to a logit with log-add-exp keeps BCE
-        # numerically stable. It also makes the query gate a strict prerequisite:
-        # compatibility can never raise contact probability above gate probability.
-        contact_logits = -torch.logaddexp(
-            -query_gate_logits,
-            torch.logaddexp(
-                -compatibility_contact_logits,
-                -query_gate_logits - compatibility_contact_logits,
-            ),
-        )
+            # p(contact) = sigmoid(gate_logits) * sigmoid(compatibility_logits).
+            # Log-add-exp converts the product back to stable BCE logits and
+            # ensures contact probability cannot exceed gate probability.
+            contact_logits = -torch.logaddexp(
+                -query_gate_logits,
+                torch.logaddexp(
+                    -compatibility_contact_logits,
+                    -query_gate_logits - compatibility_contact_logits,
+                ),
+            )
 
         if return_patch_details:
             return (
@@ -364,6 +386,7 @@ class QueryPatchInteractionModel(DScriptInteractionModel):
         compatibility_scale: float = 2,
         query_gate_bias_init: float = 0.0,
         compatibility_head: str = "bilinear",
+        query_evidence_mode: str = "gated",
     ) -> None:
         # Constructing the common parent first retains its projection, public
         # prediction API, constrained interaction parameters, and both pooling
@@ -397,6 +420,7 @@ class QueryPatchInteractionModel(DScriptInteractionModel):
             compatibility_head=compatibility_head,
             contact_hidden_dim=contact_hidden_dim,
             contact_width=contact_width,
+            query_evidence_mode=query_evidence_mode,
         )
 
     def contact_logits(
@@ -432,7 +456,7 @@ class QueryPatchInteractionModel(DScriptInteractionModel):
         torch.Tensor,
         torch.Tensor,
         torch.Tensor,
-        torch.Tensor,
+        torch.Tensor | None,
         torch.Tensor,
         torch.Tensor,
         torch.Tensor,
@@ -443,6 +467,7 @@ class QueryPatchInteractionModel(DScriptInteractionModel):
         without changing the standard D-SCRIPT-compatible ``forward`` contract.
         Contact logits at padded residue pairs are zeroed exactly as in the base
         model; returned query masks are already zero at padded residues.
+        Additive mode returns ``None`` in the gate-logit slot.
         """
         self._validate_inputs(embeddings_1, embeddings_2)
         projected_1 = self.projection(embeddings_1)
@@ -467,7 +492,8 @@ class QueryPatchInteractionModel(DScriptInteractionModel):
         ) = outputs
         pair_mask = self._pair_mask(contact_logits, mask_1, mask_2)
         contact_logits = contact_logits.masked_fill(~pair_mask, 0.0)
-        query_gate_logits = query_gate_logits.masked_fill(~pair_mask, -20.0)
+        if query_gate_logits is not None:
+            query_gate_logits = query_gate_logits.masked_fill(~pair_mask, -20.0)
         compatibility_contact_logits = compatibility_contact_logits.masked_fill(
             ~pair_mask, -20.0
         )
@@ -502,6 +528,10 @@ class QueryPatchInteractionModel(DScriptInteractionModel):
             interface_logits_1,
             interface_logits_2,
         ) = self.query_patch_outputs(embeddings_1, embeddings_2, mask_1, mask_2)
+        # QP-Additive predates branch-specific auxiliary supervision. Its query
+        # and compatibility branches are trained through the final logits only.
+        if self.contact_module.query_evidence_mode == "additive":
+            return contact_logits, {}
         return contact_logits, {
             "query_gate_logits": query_gate_logits,
             "query_gate_scale": F.softplus(self.contact_module.query_gate_raw_scale),

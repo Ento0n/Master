@@ -41,6 +41,12 @@ missing validation/test split omits that stage. The homo/hetero metrics are
 omitted if that subgroup is absent, and the positive/negative interface means are
 omitted when their corresponding class is absent.
 
+The query-patch column below describes the default `--query-evidence-mode gated`.
+With `--query-evidence-mode additive`, the model optimizes only the shared
+interaction/final-contact losses and emits the same metric keys as D-SCRIPT.
+It has no auxiliary losses, gate diagnostics, separate `optimization_loss`, or
+`contact_objective` metric.
+
 | Metric name or pattern | Fully connected | D-SCRIPT | Query patch | Stages |
 |---|:---:|:---:|:---:|---|
 | `{stage}_loss` | yes | yes | yes | train, val, test |
@@ -370,6 +376,8 @@ Both custom contact AUPRC metrics keep additive distributed states, so their
 results do not depend on batch boundaries.
 
 ## Query-patch-only losses and diagnostics
+
+This section applies only to `--query-evidence-mode gated`.
 
 The final query-patch contact probability is the product of two branch
 probabilities:
