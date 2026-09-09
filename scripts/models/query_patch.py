@@ -24,7 +24,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from .dscript import DScriptInteractionModel
+from .dscript import DScriptContactModule, DScriptInteractionModel
 
 
 class QueryPatchContactModule(nn.Module):
@@ -47,6 +47,9 @@ class QueryPatchContactModule(nn.Module):
         compatibility_rank: int = 32,
         compatibility_scale: float = 2,
         query_gate_bias_init: float = 0.0,
+        compatibility_head: str = "bilinear",
+        contact_hidden_dim: int = 50,
+        contact_width: int = 7,
     ) -> None:
         super().__init__()
         if projection_dim <= 0:
@@ -59,6 +62,10 @@ class QueryPatchContactModule(nn.Module):
             raise ValueError("num_layers must be positive")
         if not 0.0 <= dropout < 1.0:
             raise ValueError("dropout must be in [0, 1)")
+        if compatibility_head not in {"bilinear", "dscript"}:
+            raise ValueError(
+                "compatibility_head must be either 'bilinear' or 'dscript'"
+            )
 
         self.projection_dim = projection_dim
         self.num_queries = num_queries
@@ -115,25 +122,37 @@ class QueryPatchContactModule(nn.Module):
         self.query_gate_raw_scale = nn.Parameter(torch.tensor(initial_raw_scale))
         self.query_gate_bias = nn.Parameter(torch.tensor(float(query_gate_bias_init)))
 
-        # compatibility: allowing the model to learn interface connections
-        self.compatibility_rank = compatibility_rank
+        # Construct only the selected compatibility head. This keeps old
+        # bilinear checkpoints unchanged and avoids adding inactive parameters
+        # to the optimizer when the local D-SCRIPT head is selected.
+        self.compatibility_head = compatibility_head
+        self.compatibility_module: DScriptContactModule | None = None
+        if compatibility_head == "bilinear":
+            self.compatibility_rank = compatibility_rank
+            self.compatibility_norm = nn.LayerNorm(projection_dim)
+            self.compatibility_projection = nn.Linear(
+                projection_dim,
+                compatibility_rank,
+                bias=False,
+            )
 
-        self.compatibility_norm = nn.LayerNorm(projection_dim)
-        self.compatibility_projection = nn.Linear(
-            projection_dim,
-            compatibility_rank,
-            bias=False,
-        )
-
-        # metric gives compatibility for residue pairs by going over projected ranks
-        metric = torch.ones(compatibility_rank)
-        metric[1::2] = -1.0
-        self.compatibility_metric = nn.Parameter(metric)
-
-        self.register_buffer(
-            "compatibility_scale",
-            torch.tensor(float(compatibility_scale))
-        )
+            # Alternating signs let the low-rank metric learn both matching and
+            # opposing residue features while retaining the old initialization.
+            metric = torch.ones(compatibility_rank)
+            metric[1::2] = -1.0
+            self.compatibility_metric = nn.Parameter(metric)
+            self.register_buffer(
+                "compatibility_scale",
+                torch.tensor(float(compatibility_scale)),
+            )
+        else:
+            # This head builds |z1-z2| and z1*z2 pair features, then refines
+            # them with a local convolution over the two residue axes.
+            self.compatibility_module = DScriptContactModule(
+                projection_dim=projection_dim,
+                hidden_dim=contact_hidden_dim,
+                contact_width=contact_width,
+            )
 
     def forward(
         self,
@@ -240,42 +259,49 @@ class QueryPatchContactModule(nn.Module):
 
         query_evidence = query_evidence.masked_fill(~pair_mask, 0.0)
 
-        ### Signed pairwise residue compatibility
-        normalized_1 = self.compatibility_norm(projected_1)
-        normalized_2 = self.compatibility_norm(projected_2)
-        # scale: [B, Lx, D]
+        # Both alternatives return one compatibility logit per residue pair.
+        # The query gate remains independent and is applied only afterward.
+        if self.compatibility_head == "bilinear":
+            normalized_1 = self.compatibility_norm(projected_1)
+            normalized_2 = self.compatibility_norm(projected_2)
+            # shape: [B, Lx, D]
 
-        compatibility_1 = F.normalize(
-            self.compatibility_projection(normalized_1),
-            p=2,
-            dim=-1,
-        )
-        compatibility_2 = F.normalize(
-            self.compatibility_projection(normalized_2),
-            p=2,
-            dim=-1,
-        )
-        # scale: [B, Lx, metric_rank: R]
+            compatibility_1 = F.normalize(
+                self.compatibility_projection(normalized_1),
+                p=2,
+                dim=-1,
+            )
+            compatibility_2 = F.normalize(
+                self.compatibility_projection(normalized_2),
+                p=2,
+                dim=-1,
+            )
+            # shape: [B, Lx, compatibility_rank]
 
-        # push compatibility metric into [-1, 1]
-        compatibility_metric = torch.tanh(self.compatibility_metric)
-
-        compatibility_evidence = torch.bmm(
-            compatibility_1 * compatibility_metric,
-            compatibility_2.transpose(1, 2)
-        )
-        compatibility_evidence = compatibility_evidence.masked_fill(
-            ~pair_mask, 0.0
-        )
-        # shape: [B, L1, L2]
+            compatibility_metric = torch.tanh(self.compatibility_metric)
+            compatibility_evidence = torch.bmm(
+                compatibility_1 * compatibility_metric,
+                compatibility_2.transpose(1, 2),
+            )
+            compatibility_evidence = compatibility_evidence.masked_fill(
+                ~pair_mask,
+                0.0,
+            )
+            compatibility_contact_logits = (
+                self.compatibility_scale * compatibility_evidence
+                + self.contact_bias
+            )
+        else:
+            if self.compatibility_module is None:
+                raise RuntimeError("D-SCRIPT compatibility module is not initialized")
+            compatibility_contact_logits = (
+                self.compatibility_module(projected_1, projected_2)
+                + self.contact_bias
+            )
 
         ### Use query patches as a soft prerequisite for compatibility
         gate_scale = F.softplus(self.query_gate_raw_scale)
         query_gate_logits = gate_scale * query_evidence + self.query_gate_bias
-
-        compatibility_contact_logits = (
-            self.compatibility_scale * compatibility_evidence + self.contact_bias
-        )
 
         # The final contact probability is exactly
         #   sigmoid(query_gate_logits) * sigmoid(compatibility_contact_logits).
@@ -305,8 +331,9 @@ class QueryPatchContactModule(nn.Module):
         return contact_logits
 
     def clip_parameters(self) -> None:
-        """Provide the interface required by D-SCRIPT's optimizer hook."""
-        return None
+        """Apply the selected compatibility head's parameter constraints."""
+        if self.compatibility_module is not None:
+            self.compatibility_module.clip_parameters()
 
 
 class QueryPatchInteractionModel(DScriptInteractionModel):
@@ -336,6 +363,7 @@ class QueryPatchInteractionModel(DScriptInteractionModel):
         compatibility_rank: int = 32,
         compatibility_scale: float = 2,
         query_gate_bias_init: float = 0.0,
+        compatibility_head: str = "bilinear",
     ) -> None:
         # Constructing the common parent first retains its projection, public
         # prediction API, constrained interaction parameters, and both pooling
@@ -366,6 +394,9 @@ class QueryPatchInteractionModel(DScriptInteractionModel):
             compatibility_rank=compatibility_rank,
             compatibility_scale=compatibility_scale,
             query_gate_bias_init=query_gate_bias_init,
+            compatibility_head=compatibility_head,
+            contact_hidden_dim=contact_hidden_dim,
+            contact_width=contact_width,
         )
 
     def contact_logits(

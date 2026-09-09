@@ -214,6 +214,15 @@ def parse_args() -> argparse.Namespace:
         help="Use zero contact targets for negative examples instead of unknown (-1).",
     )
     parser.add_argument("--max-pooling", action="store_true", help="Using max pooling for normal interaction head.")
+    parser.add_argument(
+        "--compatibility-head",
+        choices=("bilinear", "dscript"),
+        default="bilinear",
+        help=(
+            "Compatibility head for query_patch: the existing signed bilinear "
+            "head or the local pairwise D-SCRIPT convolutional head."
+        ),
+    )
     parser.add_argument("--compatibility-rank", type=int, default=64, help="The dimension in which the compatibility for the query patch model is executed.")
     parser.add_argument("--compatibility-scale", type=float, default=10, help="The scale in which the compatibility is applied to the contact logits.")
     return parser.parse_args()
@@ -1749,6 +1758,7 @@ class QueryPatchLightningModule(DScriptLightningModule):
         compatibility_scale: float = 2,
         omega: float = 0.5,
         interface_omega: float = 0.2,
+        compatibility_head: str = "bilinear",
     ) -> None:
         super().__init__(
             embedding_dim=embedding_dim,
@@ -1789,6 +1799,7 @@ class QueryPatchLightningModule(DScriptLightningModule):
             query_gate_bias_init=query_gate_bias_init,
             compatibility_rank=compatibility_rank,
             compatibility_scale=compatibility_scale,
+            compatibility_head=compatibility_head,
         )
 
     def compute_auxiliary_contact_loss(
@@ -1959,6 +1970,7 @@ def build_data_module_and_model(
             interface_omega=args.interface_omega,
             compatibility_rank=args.compatibility_rank,
             compatibility_scale=args.compatibility_scale,
+            compatibility_head=args.compatibility_head,
         )
     else:
         model = DScriptLightningModule(**model_options)
@@ -2305,10 +2317,23 @@ def main() -> None:
                         f"qgbias={args.query_gate_bias_init}",
                         f"qifw={args.query_gate_loss_weight}",
                         f"ifomega={args.interface_omega}",
-                        f"rank={args.compatibility_rank}",
-                        f"scale={args.compatibility_scale}",
+                        f"compat={args.compatibility_head}",
                     )
                 )
+                if args.compatibility_head == "bilinear":
+                    output_name_parts.extend(
+                        (
+                            f"rank={args.compatibility_rank}",
+                            f"scale={args.compatibility_scale}",
+                        )
+                    )
+                else:
+                    output_name_parts.extend(
+                        (
+                            f"contacthidden={args.contact_hidden_dim}",
+                            f"contactwidth={args.contact_width}",
+                        )
+                    )
         else:
             # The fully-connected baseline uses a different set of effective
             # model arguments and therefore receives its own comparable suffix.
