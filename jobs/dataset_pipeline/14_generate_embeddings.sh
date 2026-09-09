@@ -16,4 +16,4 @@
 set -euo pipefail
 
 python -c 'import os, sys, torch; print(f"python={sys.executable}"); print("CUDA_VISIBLE_DEVICES=" + os.environ.get("CUDA_VISIBLE_DEVICES", "<unset>")); print(f"torch={torch.__version__} torch_cuda={torch.version.cuda} cuda_available={torch.cuda.is_available()} cuda_devices={torch.cuda.device_count()}")'
-python /nfs/home/students/a.spannagl/master_repository/scripts/data_pipeline/14_generate_embeddings.py --device cuda
+python /nfs/home/students/a.spannagl/master_repository/scripts/data_pipeline/14_generate_embeddings.py --device cuda --force
