@@ -55,7 +55,15 @@ DEFAULT_CONTACT_MAP_DIR = Path("/nfs/scratch/pdb_dimers/contact_maps/data")
 DEFAULT_OUTPUT_DIR = Path("/nfs/home/students/a.spannagl/master_repository/jobs/training_pipeline/results")
 CONTACT_MAP_SAMPLE_COUNT = 5
 
+# Contact-map models historically selected checkpoints by macro contact AUPRC.
+# The CLI can override this for controlled experiments whose primary endpoint is
+# interaction prediction, while leaving existing jobs unchanged by default.
 MONITOR = "val_contact_auprc_macro"
+SELECTION_METRIC_MODES = {
+    "val_loss": "min",
+    "val_interaction_auprc": "max",
+    "val_contact_auprc_macro": "max",
+}
 
 
 def parse_args() -> argparse.Namespace:
@@ -110,6 +118,48 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num-workers", type=int, default=4, help="DataLoader worker processes.")
     parser.add_argument("--max-epochs", type=int, default=10, help="Number of training epochs.")
     parser.add_argument("--learning-rate", type=float, default=1e-3, help="Adam learning rate.")
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=42,
+        help="Random seed used by Python, NumPy, PyTorch, and DataLoader workers.",
+    )
+    parser.add_argument(
+        "--selection-monitor",
+        choices=("auto", *SELECTION_METRIC_MODES),
+        default="auto",
+        help=(
+            "Validation metric used for checkpointing and early stopping. "
+            "'auto' uses val_loss for fully_connected and macro contact AUPRC "
+            "for D-SCRIPT/query_patch."
+        ),
+    )
+    parser.add_argument(
+        "--selection-tiebreaker",
+        choices=("val_interaction_auprc", "val_contact_auprc_macro"),
+        default=None,
+        help=(
+            "Optional secondary validation metric to report from the checkpoint "
+            "selected by --selection-monitor. It does not alter checkpointing."
+        ),
+    )
+    parser.add_argument(
+        "--skip-test",
+        action="store_true",
+        help="Skip test evaluation and test-output export during model selection.",
+    )
+    parser.add_argument(
+        "--early-stopping-patience",
+        type=int,
+        default=5,
+        help="Validation epochs without a sufficient primary-metric improvement before stopping.",
+    )
+    parser.add_argument(
+        "--early-stopping-min-delta",
+        type=float,
+        default=0.01,
+        help="Minimum primary-metric change counted by early stopping.",
+    )
     parser.add_argument("--hidden-dim", type=int, default=512, help="Fully connected baseline hidden width.")
     parser.add_argument("--dropout", type=float, default=0.2, help="Fully connected baseline dropout.")
     parser.add_argument("--embedding-dim", type=int, default=1280, help="D-SCRIPT per-residue embedding size.")
@@ -217,14 +267,14 @@ def parse_args() -> argparse.Namespace:
         help="Positive-class weight for final and compatibility contact-map balanced BCEs.",
     )
     parser.add_argument("--int-mod-type", default="normal", type=str, choices=("normal", "max"), help="Which loss type to apply for the contact map, choices: normal, max")
-    parser.add_argument("--trainable-final-slope", action="store_true", help="DScript Interaction module slope applied.")
+    parser.add_argument("--trainable-final-slope", action="store_true", default=True, help="DScript Interaction module slope applied.")
     parser.add_argument("--gamma-init", type=float, default=0.0, help="DScript gamma parameter of interaction module, (gamma*variance)-mean as threshold of high contacts.")
     parser.add_argument(
         "--negative-contact-maps",
         action="store_true",
         help="Use zero contact targets for negative examples instead of unknown (-1).",
     )
-    parser.add_argument("--max-pooling", action="store_true", help="Using max pooling for normal interaction head.")
+    parser.add_argument("--max-pooling", action="store_true", default=True, help="Using max pooling for normal interaction head.")
     parser.add_argument(
         "--compatibility-head",
         choices=("bilinear", "dscript"),
@@ -246,6 +296,19 @@ def validate_args(args: argparse.Namespace) -> None:
     # whenever contact labels exist in the batch.
     if not 0.0 <= args.interaction_loss_lambda <= 1.0:
         raise ValueError("--interaction-loss-lambda must be between 0 and 1")
+
+    if args.seed < 0:
+        raise ValueError("--seed must be non-negative")
+    if args.early_stopping_patience < 0:
+        raise ValueError("--early-stopping-patience must be non-negative")
+    if args.early_stopping_min_delta < 0.0:
+        raise ValueError("--early-stopping-min-delta must be non-negative")
+
+    selection_monitor = resolve_selection_monitor(args.model, args.selection_monitor)
+    if args.selection_tiebreaker == selection_monitor:
+        raise ValueError("--selection-tiebreaker must differ from --selection-monitor")
+    if args.model == "fully_connected" and args.selection_tiebreaker == "val_contact_auprc_macro":
+        raise ValueError("The fully_connected model does not produce val_contact_auprc_macro")
 
     # The threshold is used for metrics only. The contact-map loss uses the raw
     # logits directly because thresholding would make the loss non-differentiable.
@@ -276,6 +339,22 @@ def validate_args(args: argparse.Namespace) -> None:
             raise ValueError("--query-dropout must be in [0, 1)")
         if args.query_gate_loss_weight < 0.0:
             raise ValueError("--query-interface-loss-weight must be non-negative")
+
+
+def resolve_selection_monitor(model_name: str, requested_monitor: str) -> str:
+    """Resolve the checkpoint metric while preserving model-specific defaults.
+
+    Fully connected models do not produce contact maps, so macro contact AUPRC
+    is invalid for them. D-SCRIPT and QUERY-PATCH expose all three configured
+    metrics and default to the contact-map metric used by recent experiments.
+    """
+    if requested_monitor == "auto":
+        monitor = "val_loss" if model_name == "fully_connected" else MONITOR
+    else:
+        monitor = requested_monitor
+    if model_name == "fully_connected" and monitor == "val_contact_auprc_macro":
+        raise ValueError("The fully_connected model does not produce val_contact_auprc_macro")
+    return monitor
 
 
 def split_pair(value: object, column_name: str) -> tuple[str, str]:
@@ -2301,10 +2380,64 @@ def save_test_contact_map_samples(
     print(f"Saved predicted and true contact-map PNGs for {sample_size} test examples to {output_dir}")
 
 
+def selected_validation_row(
+    metrics_path: Path,
+    selection_monitor: str,
+    selection_tiebreaker: str | None,
+) -> dict[str, float]:
+    """Return primary and tie-break metrics from the selected validation epoch.
+
+    Lightning's CSV logger stores all validation metrics from an epoch in the
+    same row. Selecting that row by the primary metric reproduces
+    ModelCheckpoint's strict best-score rule and, crucially, reports the
+    secondary metric from the same model state rather than from the last epoch.
+    """
+    metrics = pd.read_csv(metrics_path)
+    requested_metrics = [selection_monitor]
+    if selection_tiebreaker is not None:
+        requested_metrics.append(selection_tiebreaker)
+
+    missing_metrics = [metric for metric in requested_metrics if metric not in metrics.columns]
+    if missing_metrics:
+        raise RuntimeError(
+            f"Cannot report selected validation metrics; {metrics_path} lacks: "
+            f"{', '.join(missing_metrics)}"
+        )
+
+    # CSV files also contain train/test-only rows, whose validation columns are
+    # empty. Coercion protects selection from a partially written/non-numeric
+    # value while retaining the original row for the secondary metric.
+    primary_values = pd.to_numeric(metrics[selection_monitor], errors="coerce")
+    validation_rows = metrics.loc[primary_values.notna()].copy()
+    if validation_rows.empty:
+        raise RuntimeError(f"No values for {selection_monitor} were logged to {metrics_path}")
+
+    validation_primary = pd.to_numeric(validation_rows[selection_monitor], errors="coerce")
+    if SELECTION_METRIC_MODES[selection_monitor] == "max":
+        selected_index = validation_primary.idxmax()
+    else:
+        selected_index = validation_primary.idxmin()
+    selected = validation_rows.loc[selected_index]
+
+    result = {selection_monitor: float(selected[selection_monitor])}
+    if selection_tiebreaker is not None:
+        tiebreaker_value = pd.to_numeric(selected[selection_tiebreaker], errors="coerce")
+        if pd.isna(tiebreaker_value):
+            raise RuntimeError(
+                f"{selection_tiebreaker} was not logged in the selected {selection_monitor} row"
+            )
+        result[selection_tiebreaker] = float(tiebreaker_value)
+    if "epoch" in selected and pd.notna(selected["epoch"]):
+        result["epoch"] = float(selected["epoch"])
+    return result
+
+
 def main() -> None:
     """Wire the data module, model, trainer, and final test run together."""
     args = parse_args()
     validate_args(args)
+    selection_monitor = resolve_selection_monitor(args.model, args.selection_monitor)
+    selection_mode = SELECTION_METRIC_MODES[selection_monitor]
 
     # Build a compact, reproducible directory name from effective CLI arguments
     # while still allowing an explicit --output-subdir override. Query-patch
@@ -2378,7 +2511,13 @@ def main() -> None:
                     f"lossmode={args.loss_mode}",
                 )
             )
-        output_name_parts.append(f"omega={args.omega}")
+        output_name_parts.extend(
+            (
+                f"omega={args.omega}",
+                f"select={selection_monitor.removeprefix('val_')}",
+                f"seed={args.seed}",
+            )
+        )
         args.output_subdir = "_".join(output_name_parts)
         # Generated names contain only ASCII choices/numbers. Long sweep float
         # values can exceed the filesystem's 255-byte component limit; retain a
@@ -2389,8 +2528,9 @@ def main() -> None:
             name_digest = hashlib.sha256(encoded_name).hexdigest()[:16]
             args.output_subdir = f"{args.output_subdir[:238]}_{name_digest}"
 
-    # Set pytorch lightning seed & set up tensor cores
-    pl.seed_everything(42)
+    # Seed model initialization, shuffling, and worker-local random generators.
+    # Paired seeds let controlled sweeps attribute changes to the varied setting.
+    pl.seed_everything(args.seed, workers=True)
     torch.set_float32_matmul_precision("high") # highest, high or medium
 
     # If no interaction file is passed, train on the strict balanced split. The
@@ -2408,8 +2548,6 @@ def main() -> None:
     data_module.setup("fit")
 
     has_validation = data_module.val_dataset is not None and len(data_module.val_dataset) > 0
-    selection_monitor = "val_loss" if args.model == "fully_connected" else MONITOR
-    selection_mode = "min" if args.model == "fully_connected" else "max"
     if has_validation:
         # Keep the checkpoint with the best validation metric and also save
         # "last" for resuming/debugging.
@@ -2434,8 +2572,8 @@ def main() -> None:
     early_stopping = EarlyStopping(
         monitor=selection_monitor,
         mode=selection_mode,
-        patience=5,
-        min_delta=0.01,
+        patience=args.early_stopping_patience,
+        min_delta=args.early_stopping_min_delta,
         verbose=True
     )
 
@@ -2453,35 +2591,64 @@ def main() -> None:
 
     trainer.fit(model, datamodule=data_module)
 
-    # log best score to be able to look at best instead of last in WandB
-    best_score = checkpoint_callback.best_model_score.detach().cpu().item()
+    # Flush epoch metrics before locating the row selected by the primary
+    # validation metric. The optional tie-breaker is read from that exact row.
+    csv_logger.save()
+    metrics_path = Path(csv_logger.log_dir) / "metrics.csv"
+    run_output_dir = args.output_dir / args.output_subdir
+    selection_summary: dict[str, float | int | str] = {
+        "selection_monitor": selection_monitor,
+        "seed": args.seed,
+        "loss_type": args.loss_type,
+    }
+    if has_validation:
+        best_score = checkpoint_callback.best_model_score.detach().cpu().item()
+        selection_summary["best_" + selection_monitor] = best_score
+        selected_metrics = selected_validation_row(
+            metrics_path,
+            selection_monitor,
+            args.selection_tiebreaker,
+        )
+        selection_summary.update(
+            {f"selected_{metric}": value for metric, value in selected_metrics.items()}
+        )
 
-    wandb_logger.log_metrics(
-        {"best_" + selection_monitor: best_score},
-        step=trainer.global_step,
-    )
+        # W&B sweep/run tables can sort by the primary value and consult the
+        # secondary value only for a tie. A local TSV provides the same record
+        # without requiring W&B access.
+        numeric_selection_metrics = {
+            key: value
+            for key, value in selection_summary.items()
+            if isinstance(value, (int, float))
+        }
+        wandb_logger.log_metrics(numeric_selection_metrics, step=trainer.global_step)
+        run_output_dir.mkdir(parents=True, exist_ok=True)
+        selection_summary_path = run_output_dir / "selected_validation_metrics.tsv"
+        pd.DataFrame([selection_summary]).to_csv(
+            selection_summary_path,
+            sep="\t",
+            index=False,
+        )
+        print(f"Saved selected validation metrics to {selection_summary_path}")
 
-
-    if data_module.test_dataset and len(data_module.test_dataset) > 0:
+    if not args.skip_test and data_module.test_dataset and len(data_module.test_dataset) > 0:
         # If validation existed, test the best validation checkpoint. Otherwise
         # test the current final weights.
         trainer.test(model, datamodule=data_module, ckpt_path="best" if has_validation else None)
 
-    prediction_model = model
-    if has_validation and checkpoint_callback.best_model_path:
-        # The prediction table should describe the same selected model as the
-        # validation-based checkpoint/test result, not necessarily the final
-        # epoch weights after training.
-        prediction_model = type(model).load_from_checkpoint(checkpoint_callback.best_model_path)
-        prediction_model.to(trainer.strategy.root_device)
-
     csv_logger.save()
-    metrics_path = Path(csv_logger.log_dir) / "metrics.csv"
-    run_output_dir = args.output_dir / args.output_subdir
     save_loss_plot(metrics_path, run_output_dir / "loss_curve.png")
     save_auprc_plots(metrics_path, run_output_dir)
-    save_prediction_table(data_module, prediction_model, args.output_dir / args.output_subdir / "test_predictions.tsv")
-    save_test_contact_map_samples(data_module, prediction_model, args.output_dir / args.output_subdir / "contact_maps")
+
+    if not args.skip_test:
+        prediction_model = model
+        if has_validation and checkpoint_callback.best_model_path:
+            # Test exports must describe the same selected checkpoint, not the
+            # possibly different model weights from the final training epoch.
+            prediction_model = type(model).load_from_checkpoint(checkpoint_callback.best_model_path)
+            prediction_model.to(trainer.strategy.root_device)
+        save_prediction_table(data_module, prediction_model, run_output_dir / "test_predictions.tsv")
+        save_test_contact_map_samples(data_module, prediction_model, run_output_dir / "contact_maps")
 
 
 if __name__ == "__main__":
