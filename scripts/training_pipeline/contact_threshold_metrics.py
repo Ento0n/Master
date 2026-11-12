@@ -1,9 +1,9 @@
 """Fit one validation contact cutoff, then evaluate it on known residue cells.
 
 Each ``update`` receives a single structural map flattened after removing padding
-and unknown labels. Macro F1 weights each nonempty map equally; micro metrics
-pool its known cells. An all-negative structural map is real evaluation data and
-has F1/AP zero. Empty maps contribute neither cells nor a macro denominator.
+and unknown labels. Each metric weights nonempty maps equally. An all-negative
+structural map is real evaluation data and has F1/AP zero. Empty maps contribute
+neither cells nor an averaging denominator.
 
 The exact search stores one event per distinct score within each map, not a
 Python object per residue cell. Grouped score events update global confusion
@@ -70,14 +70,15 @@ def contact_metrics(labels, scores, threshold: float) -> dict:
 
 
 def aggregate_contact_metrics(per_map_metrics) -> dict:
-    """Report equal-map macro metrics and cell-pooled micro metrics.
+    """Average map-level ratios equally and retain summed cell counts.
 
     Empty maps are excluded even if the caller passes their zero-valued metric
-    records. All-negative nonempty maps remain in both denominators. The input
-    may be a generator, allowing inference to discard each full map immediately.
+    records. All-negative nonempty maps remain in the averaging denominator.
+    The input may be a generator, allowing inference to discard each full map
+    immediately. Cell counts describe the cohort; they do not set metric weights.
     """
     totals = {key: 0 for key in ("tp", "tn", "fp", "fn")}
-    macro = {key: 0.0 for key in ("accuracy", "precision", "recall", "f1")}
+    metric_sums = {key: 0.0 for key in ("accuracy", "precision", "recall", "f1")}
     n_maps = 0
     for metrics in per_map_metrics:
         if not metrics["known_cells"]:
@@ -85,17 +86,17 @@ def aggregate_contact_metrics(per_map_metrics) -> dict:
         n_maps += 1
         for key in totals:
             totals[key] += int(metrics[key])
-        for key in macro:
-            macro[key] += float(metrics[key])
+        for key in metric_sums:
+            metric_sums[key] += float(metrics[key])
     if not n_maps:
         raise ValueError("No maps with known contact cells are available")
-    micro = _metrics_from_counts(**totals)
     return {
-        "macro": {key: value / n_maps for key, value in macro.items()},
-        "micro": micro,
+        **{key: value / n_maps for key, value in metric_sums.items()},
+        **totals,
         "n_maps": n_maps,
-        "known_cells": micro["known_cells"],
-        "positive_cells": micro["positive_cells"],
+        "known_cells": sum(totals.values()),
+        "positive_cells": totals["tp"] + totals["fn"],
+        "predicted_positive": totals["tp"] + totals["fp"],
     }
 
 
@@ -128,7 +129,7 @@ class ExactContactThresholdSearch:
     per stored event on platforms with extended-precision NumPy long doubles.
     Selection temporarily allocates sorting/grouping arrays. There are no Python
     loops over individual residue cells or candidate cutoffs. Extended precision
-    limits accumulated rounding in macro-F1 deltas across many large maps.
+    limits accumulated rounding in F1 deltas across many large maps.
     """
 
     def __init__(self) -> None:
@@ -171,7 +172,7 @@ class ExactContactThresholdSearch:
         self.known_cells += n
         self.positive_cells += positives
 
-    def select(self, objective: str = "macro_f1", max_curve_points: int = 2001) -> tuple[float, list[dict], dict]:
+    def select(self, objective: str = "f1", max_curve_points: int = 2001) -> tuple[float, list[dict], dict]:
         """Optimize every score split; thin only the exported diagnostic curve.
 
         Candidates match the interaction-threshold convention: 0 (all positive),
@@ -179,14 +180,14 @@ class ExactContactThresholdSearch:
         negative), and 0.5. With adjacent floating-point scores, the upper score
         replaces an unrepresentable midpoint under the >= comparison rule.
         Ties prefer the candidate closest to 0.5, then the smaller candidate.
-        Macro-F1 ties allow only extended-precision roundoff (64 machine eps).
+        F1 ties allow only extended-precision roundoff (64 machine eps).
 
         At most ``max_curve_points`` rows are returned, always including both
         boundaries, the selected cutoff, and 0.5. Selection requires at least
         one positive known contact in the complete validation cohort.
         """
-        if objective not in ("macro_f1", "micro_f1", "micro_accuracy"):
-            raise ValueError("Objective must be macro_f1, micro_f1, or micro_accuracy")
+        if objective != "f1":
+            raise ValueError("Objective must be f1")
         if not isinstance(max_curve_points, (int, np.integer)) or max_curve_points < 4:
             raise ValueError("max_curve_points must be an integer of at least 4")
         if not self.n_maps or not self.positive_cells:
@@ -211,9 +212,9 @@ class ExactContactThresholdSearch:
         # have been removed. The zero state and final state are constant labels.
         fn = np.r_[0, np.cumsum(removed_positive)]
         tn = np.r_[0, np.cumsum(removed_negative)]
-        macro_f1 = np.r_[self._initial_f1_sum, self._initial_f1_sum + np.cumsum(f1_delta)] / self.n_maps
-        macro_f1[-1] = 0
-        np.clip(macro_f1, 0, 1, out=macro_f1)
+        f1 = np.r_[self._initial_f1_sum, self._initial_f1_sum + np.cumsum(f1_delta)] / self.n_maps
+        f1[-1] = 0
+        np.clip(f1, 0, 1, out=f1)
         del removed_positive, removed_negative, f1_delta
         thresholds = np.empty(scores.size + 1, dtype=np.float64)
         thresholds[0] = 0.0
@@ -223,27 +224,17 @@ class ExactContactThresholdSearch:
         default_state = int(np.searchsorted(scores, 0.5, side="left"))
         default_is_candidate = bool(np.any(thresholds == 0.5))
 
-        # Accuracy compares integer correct-cell counts. Micro F1 uses extended
-        # precision ratios; macro F1 uses the accumulated per-map delta curve.
-        # The explicit default may represent an already covered state but is an
-        # additional candidate because the distance-to-0.5 tie break matters.
-        if objective == "micro_accuracy":
-            values = self.positive_cells - fn + tn
-        elif objective == "micro_f1":
-            tp = self.positive_cells - fn
-            denominator = self.positive_cells + self.known_cells - fn - tn
-            values = np.zeros(fn.size, dtype=np.longdouble)
-            np.divide(2 * tp.astype(np.longdouble), denominator, out=values, where=denominator != 0)
-        else:
-            values = macro_f1
-        best_value = values.max()
-        tie_atol = 64 * np.finfo(np.longdouble).eps if objective == "macro_f1" else 0.0
-        tied = np.flatnonzero(np.abs(values - best_value) <= tie_atol)
+        # F1 uses the accumulated changes in each map's ratio. The explicit
+        # default may represent an already covered state but is an additional
+        # candidate because the distance-to-0.5 tie break matters.
+        best_value = f1.max()
+        tie_atol = 64 * np.finfo(np.longdouble).eps
+        tied = np.flatnonzero(np.abs(f1 - best_value) <= tie_atol)
         # Candidates are sorted, so argmin also implements the smaller-cutoff
         # preference for two candidates equally distant from 0.5.
         best_state = int(tied[np.argmin(np.abs(thresholds[tied] - 0.5))])
         threshold = float(thresholds[best_state])
-        if abs(values[default_state] - best_value) <= tie_atol:
+        if abs(f1[default_state] - best_value) <= tie_atol:
             best_state, threshold = default_state, 0.5
 
         # Keep the exact winner and boundaries while limiting curve serialization
@@ -266,20 +257,15 @@ class ExactContactThresholdSearch:
             false_negative, true_negative = int(fn[state]), int(tn[state])
             true_positive = self.positive_cells - false_negative
             false_positive = self.known_cells - self.positive_cells - true_negative
-            metrics = _metrics_from_counts(true_positive, true_negative, false_positive, false_negative)
-            return {"threshold": float(cutoff), "macro_f1": float(macro_f1[state]),
-                    "micro_f1": metrics["f1"], "micro_accuracy": metrics["accuracy"],
+            return {"threshold": float(cutoff), "f1": float(f1[state]),
                     "tp": true_positive, "tn": true_negative, "fp": false_positive, "fn": false_negative}
 
         curve = [curve_row(int(state), thresholds[state]) for state in sampled]
         if not default_is_candidate:
             curve.append(curve_row(default_state, 0.5))
             curve.sort(key=lambda row: row["threshold"])
-        selected_value = float(values[best_state])
-        if objective == "micro_accuracy":
-            selected_value /= self.known_cells
         metadata = {
-            "objective": objective, "selected_objective_value": selected_value,
+            "objective": objective, "selected_objective_value": float(f1[best_state]),
             "n_maps": self.n_maps, "excluded_empty_maps": self.excluded_empty_maps,
             "known_cells": self.known_cells, "positive_cells": self.positive_cells,
             "unique_scores": int(scores.size),

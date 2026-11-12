@@ -2,9 +2,9 @@
 
 This document explains every project-defined metric emitted by
 [`scripts/training_pipeline/execute_pipeline.py`](../scripts/training_pipeline/execute_pipeline.py).
-It covers the current fully
-connected, D-SCRIPT, and query-patch training paths, followed by a short appendix
-for metric names that still occur in older W&B runs.
+It covers the current fully connected, adapted D-SCRIPT, and QUERY-PATCH training
+paths, followed by a short appendix for metric names that still occur in older
+W&B runs.
 
 The reference distinguishes four kinds of logged values:
 
@@ -39,15 +39,17 @@ The reference distinguishes four kinds of logged values:
 Metric keys are conditional on the selected model and on the available data. A
 missing validation/test split omits that stage. The homo/hetero metrics are
 omitted if that subgroup is absent, and the positive/negative interface means are
-omitted when their corresponding class is absent.
+omitted when their corresponding class is absent. Contact accuracy, precision,
+recall, and validation/test contact AUPRC are still logged when a present stage
+has no evaluable maps; their values are zero.
 
-The query-patch column below describes the default `--query-evidence-mode gated`.
+The QUERY-PATCH column below describes the default `--query-evidence-mode gated`.
 With `--query-evidence-mode additive`, the model optimizes only the shared
-interaction/final-contact losses and emits the same metric keys as D-SCRIPT.
+interaction/final-contact losses and emits the same metric keys as adapted D-SCRIPT.
 It has no auxiliary losses, gate diagnostics, separate `optimization_loss`, or
 `contact_objective` metric.
 
-| Metric name or pattern | Fully connected | D-SCRIPT | Query patch | Stages |
+| Metric name or pattern | Fully connected | Adapted D-SCRIPT | QUERY-PATCH | Stages |
 |---|:---:|:---:|:---:|---|
 | `{stage}_loss` | yes | yes | yes | train, val, test |
 | `{stage}_accuracy` | yes | yes | yes | train, val, test |
@@ -58,8 +60,7 @@ It has no auxiliary losses, gate diagnostics, separate `optimization_loss`, or
 | `{stage}_contact_accuracy` | no | yes | yes | train, val, test |
 | `{stage}_contact_precision` | no | yes | yes | train, val, test |
 | `{stage}_contact_recall` | no | yes | yes | train, val, test |
-| `val_contact_auprc_macro`, `test_contact_auprc_macro` | no | yes | yes | val, test |
-| `val_contact_auprc_micro`, `test_contact_auprc_micro` | no | yes | yes | val, test |
+| `val_contact_auprc`, `test_contact_auprc` | no | yes | yes | val, test |
 | `{stage}_contact_metrics_time_s` | no | yes | yes | train, val, test |
 | `{stage}_optimization_loss` | no | no | yes | train, val, test |
 | `{stage}_contact_objective` | no | no | yes | train, val, test |
@@ -71,22 +72,24 @@ It has no auxiliary losses, gate diagnostics, separate `optimization_loss`, or
 | `{stage}_interface_mask_negative_mean` | no | no | yes | train, val, test |
 | `{stage}_query_gate_scale` | no | no | yes | train, val, test |
 | `{stage}_query_gate_bias` | no | no | yes | train, val, test |
-| `best_val_loss` | yes | no | no | once after fitting; W&B only |
-| `best_val_contact_auprc_macro` | no | yes | yes | once after fitting; W&B only |
 
-When all conditional keys are present, the model families produce the following
-number of project-defined metric keys, including the model family's `best_*`
-selection metric:
+When all conditional keys are present, the following counts cover epoch-level
+project-defined metrics, excluding post-training selection summaries and logger
+metadata:
 
 | Model | Number of keys |
 |---|---:|
-| Fully connected | 11 |
-| D-SCRIPT | 33 |
-| Query patch | 63 |
+| Fully connected | 10 |
+| Adapted D-SCRIPT | 30 |
+| QUERY-PATCH, gated | 60 |
 
-There is deliberately no `train_interaction_auprc` or
-`train_contact_auprc_*`. The AUPRC metrics are reserved for validation and test
-evaluation.
+Additive QUERY-PATCH emits the same 30 keys as adapted D-SCRIPT. There is no
+`train_interaction_auprc` or `train_contact_auprc`; AUPRC is calculated only for
+validation and test evaluation.
+
+After fitting, the pipeline separately records the selected validation epoch,
+the primary metric and its best value, and the secondary metric from that epoch.
+The selected metric determines the names in this summary, as described below.
 
 ## Interaction metrics and losses
 
@@ -133,7 +136,7 @@ positive prevalence in the corresponding split.
 
 ### `{stage}_interaction_loss`
 
-Logged by D-SCRIPT and query patch. It is the weighted mean pair-level binary
+Logged by adapted D-SCRIPT and QUERY-PATCH. It is the weighted mean pair-level binary
 cross-entropy:
 
 ```text
@@ -165,7 +168,7 @@ For the fully connected model:
 stage_loss = interaction_loss
 ```
 
-For D-SCRIPT and query patch, with
+For adapted D-SCRIPT and QUERY-PATCH, with
 `lambda = --interaction-loss-lambda`:
 
 ```text
@@ -176,34 +179,35 @@ else:
     stage_loss = interaction_loss
 ```
 
-Query-patch auxiliary losses are deliberately excluded from `{stage}_loss`, even
+QUERY-PATCH auxiliary losses are deliberately excluded from `{stage}_loss`, even
 though they participate in optimization. Ordinary batch values are aggregated
 with the full protein-pair batch size. Lower is better.
 
-For D-SCRIPT and query patch, `val_loss` drives the learning-rate scheduler.
-Checkpointing and early stopping instead maximize
-`val_contact_auprc_macro`. The fully connected model continues to minimize
-`val_loss` for checkpointing and early stopping.
+For adapted D-SCRIPT and QUERY-PATCH, `val_loss` drives the learning-rate scheduler.
+Checkpointing and early stopping use `--selection-monitor`: `auto` maximizes
+`val_interaction_auprc` for contact models and minimizes `val_loss` for the fully
+connected baseline. To select contact models by contact quality instead, use
+`--selection-monitor val_contact_auprc --selection-tiebreaker val_interaction_auprc`.
 
-### `best_val_loss`
+### Post-training selection summaries
 
-For the fully connected model, this is the lowest checkpoint-monitored
-`val_loss` observed during fitting. It is logged once after training at the
-final global step.
+`best_<selection_monitor>` records the selected checkpoint's validation score.
+For the default contact-model setup this is `best_val_interaction_auprc`; selecting
+by contact AUPRC instead produces `best_val_contact_auprc`. The baseline's default
+produces `best_val_loss`. AUPRC is maximized; loss is minimized.
 
-This is the selected checkpoint's validation score, not necessarily the last
-epoch's `val_loss`. Lower is better. Unlike all `self.log` metrics,
-`best_val_loss` is sent directly to W&B and is not written to the CSV metrics
-file.
+The summary also records `selected_<selection_monitor>`,
+`selected_<selection_tiebreaker>`, and `selected_epoch`. The secondary metric is
+read from the selected primary-metric epoch; it does not change checkpointing or
+early stopping. The default secondary metric is `val_contact_auprc`. The fully
+connected baseline must explicitly use an available secondary metric, such as
+`--selection-tiebreaker val_interaction_auprc` with its default loss monitor.
 
-### `best_val_contact_auprc_macro`
-
-For D-SCRIPT and query patch, this is the highest
-`val_contact_auprc_macro` observed during fitting. It is used for checkpoint
-selection, early stopping, and W&B contact-model sweeps.
-
-This value is logged once after training at the final global step. Higher is
-better. It is sent directly to W&B and is not written to the CSV metrics file.
+These values are written once after fitting to
+`<output-dir>/<output-subdir>/selected_validation_metrics.tsv` and sent directly
+to W&B at the final global step. They are not additional columns in the CSV
+logger's epoch-level `metrics.csv`. The summary also includes the selected
+monitor, seed, and loss configuration.
 
 ## Contact-map population and masking
 
@@ -215,8 +219,8 @@ The following distinctions apply to every contact metric:
   evaluates only these maps.
 - With `--negative-contact-maps`, an example without a structural map receives an
   optional synthetic all-zero map over its real residue pairs. Synthetic maps
-  enter contact losses, thresholded contact metrics, and query-patch auxiliary
-  diagnostics, but they are explicitly excluded from both contact AUPRC metrics.
+  enter contact losses, thresholded contact metrics, and QUERY-PATCH auxiliary
+  diagnostics, but they are explicitly excluded from contact AUPRC.
 
 ## `{stage}_contact_loss`
 
@@ -298,8 +302,9 @@ mean over supervised maps.
 ## Thresholded contact metrics
 
 For these metrics, a known cell is predicted as a contact when
-`contact_probability >= --contact-threshold`. Within each batch, all known cells
-from all maps are pooled into one confusion matrix.
+`contact_probability >= --contact-threshold`. A separate confusion matrix is
+computed for each map using only its known cells. Each metric is calculated from
+that map's counts and then averaged with equal weight over evaluable maps.
 
 ### `{stage}_contact_accuracy`
 
@@ -307,7 +312,7 @@ from all maps are pooled into one confusion matrix.
 (TP + TN) / (TP + TN + FP + FN)
 ```
 
-Range: `[0, 1]`; higher is better. Contact maps are usually very sparse, so the
+Range: `[0, 1]`; higher is better. Contact-maps are usually very sparse, so the
 large number of true negatives can make this value look strong even when actual
 contacts are missed.
 
@@ -328,58 +333,45 @@ TP / (TP + FN)
 ```
 
 Answers: “Of the true residue contacts, how many did the model find?” If the
-evaluated batch has no actual positive cells, recall is defined as zero. Range:
+evaluated map has no actual positive cells, recall is defined as zero. Range:
 `[0, 1]`; higher is better.
 
-### Epoch-aggregation caveat for threshold metrics
+### Epoch aggregation for threshold metrics
 
-Contact accuracy, precision, and recall are cell-micro values **within each
-batch**, but Lightning then averages the batch values using the number of protein
-pairs as the weight. The epoch values are therefore not a single globally pooled
-contact-cell confusion matrix. Precision and recall are likewise averages of
-batch precision/recall rather than ratios of epoch-wide TP/FP/FN counts.
-
-This behavior makes the threshold metrics useful as training diagnostics, but
-the split-wide contact AUPRC metrics below are safer primary evaluation summaries.
+The epoch values are means over individual maps. Each metric accumulates the
+sum of map scores and the number of maps with at least one known cell across
+batches and distributed workers. Every batch registers these metric states for
+logging; batches without evaluable maps add zero to both states. Consequently,
+accuracy, precision, and recall give each evaluable map equal weight and do not
+depend on batch boundaries. If the whole epoch has no evaluable maps, the metric
+returns zero. Synthetic negative maps are included when enabled; their recall is
+zero because they contain no positive cells.
 
 ## Contact AUPRC
 
-### `val_contact_auprc_macro` and `test_contact_auprc_macro`
+### `val_contact_auprc` and `test_contact_auprc`
 
-Exact AP is calculated independently for each true structural contact map after
+Exact AP is calculated independently for each true structural contact-map after
 removing its `-1` cells. The per-map AP values are then averaged equally, so a
 small complex and a large complex have the same influence.
 
 - A true structural map with known cells but no positive contacts contributes
-  `AP = 0` and remains in the macro denominator.
+  `AP = 0` and remains in the mean.
 - A map without any known cell is skipped because it cannot be evaluated.
 - Synthetic negative maps are excluded.
 
-Range: `[0, 1]`; higher is better. This is usually the most direct answer to:
-“How well does the model rank contacts for a typical structural complex?”
+Range: `[0, 1]`; higher is better. This measures how well the model ranks contacts
+for a typical structural complex. The metric keeps the sum of per-map AP values
+and the number of evaluable maps as additive distributed states, so its result
+does not depend on batch boundaries. Every validation/test batch registers the
+metric for logging, including batches without structural maps. If the entire
+evaluation has no evaluable structural maps, the logged value is zero.
 
-### `val_contact_auprc_micro` and `test_contact_auprc_micro`
-
-All known cells from all true structural maps are pooled into one precision-recall
-curve. Larger or more completely resolved maps contribute more cells and therefore
-have more influence. Synthetic negative maps are excluded.
-
-To keep memory bounded, this metric places probabilities into 4,096 equal-width
-bins before computing AP. Its probability resolution is approximately
-`1 / 4096 = 0.000244`; predictions in the same bin are treated as tied. If the
-evaluation population has no positive cells, the result is zero.
-
-Range: `[0, 1]`; higher is better. This answers: “How well does the model rank
-contacts across all evaluated residue pairs combined?”
-
-Both custom contact AUPRC metrics keep additive distributed states, so their
-results do not depend on batch boundaries.
-
-## Query-patch-only losses and diagnostics
+## QUERY-PATCH-only losses and diagnostics
 
 This section applies only to `--query-evidence-mode gated`.
 
-The final query-patch contact probability is the product of two branch
+The final QUERY-PATCH contact probability is the product of two branch
 probabilities:
 
 ```text
@@ -515,7 +507,7 @@ a supervised-map-weighted average across logged batches.
 Mean wall-clock seconds per batch spent on:
 
 - main contact-loss and threshold-metric computation; and
-- query-patch auxiliary contact/interface computation, when applicable.
+- QUERY-PATCH auxiliary contact/interface computation, when applicable.
 
 GPU synchronization surrounds the timed region so queued CUDA work is included.
 The model forward pass and interaction-loss calculation are outside the timer.
@@ -555,9 +547,8 @@ probabilities; it is an output table rather than an aggregate metric.
 | Interaction loss | Protein-pair batch-size-weighted mean of batch losses. |
 | Interaction AUPRC | Exact state over the complete validation/test split. |
 | Contact loss | Pair-batch-weighted mean of per-batch supervised-map means. |
-| Contact accuracy/precision/recall | Known-cell pooling inside each batch, followed by protein-pair batch-size weighting. Not a global cell confusion matrix. |
-| Contact macro AUPRC | Exact AP per true structural map, then equal-map mean over the split. |
-| Contact micro AUPRC | 4,096-bin approximate AP over all known cells from true structural maps. |
+| Contact accuracy/precision/recall | Compute each score per map, then average equally over maps with known cells. |
+| Contact AUPRC | Exact AP per true structural map, then equal-map mean over the split. |
 | Query auxiliary losses | Supervised-map-count-weighted epoch means. |
 | Interface probability means | Known/positive/negative-residue-count-weighted epoch means. |
 | Contact metric time | Unweighted mean seconds per batch. |
@@ -567,22 +558,22 @@ probabilities; it is an output table rather than an aggregate metric.
 - For protein-pair interaction quality, use `val_interaction_auprc` during model
   development and `test_interaction_auprc` for final reporting. Keep accuracy as
   an intuitive thresholded companion.
-- For contact prediction, report both macro and micro contact AUPRC. Macro gives
-  every structural complex equal influence; micro describes the pooled
-  residue-pair population.
+- For contact prediction, use `val_contact_auprc` during model development and
+  `test_contact_auprc` for final reporting. Each structural complex contributes
+  equally to these scores.
 - Use contact precision and recall to understand behavior at the configured
-  threshold, but remember their epoch aggregation and sensitivity to that
-  threshold.
-- For D-SCRIPT and query patch, use `best_val_contact_auprc_macro` for checkpoint
-  and sweep selection. Do not compare `contact_loss` across different loss types.
-- For query patch, use `optimization_loss` to understand the full optimized
+  threshold, with the same equal weighting of evaluable maps.
+- Choose the checkpoint metric to match the experiment: the contact-model default
+  is `val_interaction_auprc`, while `val_contact_auprc` selects for contact quality.
+  Do not compare `contact_loss` across different loss types.
+- For QUERY-PATCH, use `optimization_loss` to understand the full optimized
   objective and the interface/compatibility metrics to diagnose which branch is
   improving or collapsing.
 
 ## Legacy query-gate metrics in older runs
 
 Older W&B/CSV runs may contain the following names. They came from a previous
-query-patch objective that directly supervised the residue-pair query gate against
+QUERY-PATCH objective that directly supervised the residue-pair query gate against
 contact-map cells. The current implementation instead supervises chain-wise
 interface masks and the compatibility branch.
 
@@ -608,7 +599,7 @@ keys are `{stage}_interface_mask_*` and
 
 - Metric logging and loss relationships:
   [`execute_pipeline.py`](../scripts/training_pipeline/execute_pipeline.py)
-- Contact AUPRC implementations:
+- Contact AUPRC and threshold-metric accumulation:
   [`metrics.py`](../scripts/training_pipeline/metrics.py)
 - Reusable balanced-BCE implementation:
   [`losses.py`](../scripts/training_pipeline/losses.py)

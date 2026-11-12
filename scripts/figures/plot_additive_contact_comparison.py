@@ -21,10 +21,11 @@ import sys
 import numpy as np
 
 # Direct execution puts only scripts/figures on the import path. Add the
-# repository root so the shared training helpers also resolve outside the repo.
+# repository root so the shared helpers also resolve outside the repo.
 if not __package__:
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.training_pipeline import contact_threshold_metrics
+from scripts.misc.contact_reporting import normalize_contact_summary
 from scripts.figures import _contact_map_figure
 from scripts.figures._contact_map_figure import DEFAULT_REFERENCE, render_figure, sha256, verify_metrics
 
@@ -77,7 +78,7 @@ def load_examples(analysis: Path, reference: Path) -> tuple[list, dict]:
         raise ValueError("Reference split indices must be unique")
 
     summary_path = analysis / "summary.json"
-    summary = json.loads(summary_path.read_text())
+    summary = normalize_contact_summary(json.loads(summary_path.read_text()))
     input_hashes[str(summary_path)] = sha256(summary_path)
     hyperparameters = summary["model_hyperparameters"]
     required_hyperparameters = {"query_evidence_mode": "additive",
@@ -87,11 +88,10 @@ def load_examples(analysis: Path, reference: Path) -> tuple[list, dict]:
                    for key, value in required_hyperparameters.items())
             or "prostt5" not in summary["embedding_manifest"].lower()):
         raise ValueError("Analysis must describe the ProstT5 seed-42 additive/bilinear model")
-    if summary["selection_split"] != "val" or summary["selection_metric"] != "macro_f1":
-        raise ValueError("Additive cutoff must be selected on validation macro F1")
     threshold = float(summary["threshold"])
-    if not np.isfinite(threshold):
-        raise ValueError("The validation-selected threshold must be finite")
+    if (summary["selection_split"] != "val" or summary["selection_metric"] != "f1"
+            or not np.isfinite(threshold)):
+        raise ValueError("Expected a finite validation-selected contact F1 cutoff")
     for name in ("test_maps.tsv", "test_contacts.npz"):
         path = analysis / name
         actual_hash = sha256(path)
@@ -195,7 +195,7 @@ def load_examples(analysis: Path, reference: Path) -> tuple[list, dict]:
         "reference_selection_note": reference_provenance["selection_note"],
         "display": "Complete maps with square cells and no crops or zooms; red=contact (1), "
                    "white=no contact (0), gray=unannotated (-1). Unknown cells are excluded from metrics.",
-        "threshold_selection": "Each model uses its own frozen validation-macro-F1 threshold.",
+        "threshold_selection": "Each model uses its own frozen validation F1 threshold.",
         "thresholds": examples[0]["thresholds"],
         "final_ap_note": "Final AP is preserved from the frozen CSV/provenance; binary-map counts and F1 "
                          "are independently recomputed. Additive AP is recomputed from continuous scores.",

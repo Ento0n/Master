@@ -7,7 +7,7 @@ Run with the training environment's Python; only NumPy and Matplotlib are needed
 Use the same frozen 1QC9, 1SEZ, and 7QAA assembly-1 test examples as
 plot_additive_contact_comparison.py. Predictions come from the final ProstT5
 seed-42 checkpoints (D-SCRIPT epoch 7; QUERY-PATCH Conv-IC epoch 5), each at its
-own validation-macro-F1 cutoff. No inference, training, or example selection is
+own validation F1 cutoff. No inference, training, or example selection is
 repeated. Verify the reference, checkpoint identities, and exported metrics
 before rendering. Only PNGs go to figures/; PDF and provenance stay with the run.
 """
@@ -30,6 +30,7 @@ from scripts.figures._contact_map_figure import (
     DEFAULT_REFERENCE, REPO_ROOT, render_figure, sha256, verify_metrics,
 )
 from scripts.training_pipeline import contact_threshold_metrics
+from scripts.misc.contact_reporting import normalize_contact_summary
 
 DEFAULT_ARTIFACTS = (REPO_ROOT / "jobs/training_pipeline/results/final_comparison"
                      / "prostt5/6956426/contact_map_figure")
@@ -84,7 +85,7 @@ def load_examples(reference: Path) -> tuple[list, dict]:
         input_hashes[str(summary_path)] = sha256(summary_path)
         if input_hashes[str(summary_path)] != source["sha256"]:
             raise ValueError(f"Source summary hash mismatch: {summary_path}")
-        summary = json.loads(summary_path.read_text())
+        summary = normalize_contact_summary(json.loads(summary_path.read_text()))
         parameters = summary["model_hyperparameters"]
         if (summary["model"] != model or summary["seed"] != 42
                 or "prostt5" not in summary["embedding_manifest"].lower()
@@ -95,9 +96,9 @@ def load_examples(reference: Path) -> tuple[list, dict]:
                                        or parameters["compatibility_head"] != "dscript"):
             raise ValueError("QUERY-PATCH must be the final gated Conv-IC model")
         threshold = float(provenance["thresholds"][model])
-        if (summary["selection_split"] != "val" or summary["selection_metric"] != "macro_f1"
+        if (summary["selection_split"] != "val" or summary["selection_metric"] != "f1"
                 or not np.isfinite(threshold) or threshold != float(summary["threshold"])):
-            raise ValueError(f"Inconsistent validation-macro-F1 cutoff for {model}")
+            raise ValueError(f"Inconsistent validation F1 cutoff for {model}")
         checkpoint = Path(summary["checkpoint"]).resolve(strict=True)
         input_hashes[str(checkpoint)] = sha256(checkpoint)
         if input_hashes[str(checkpoint)] != summary["checkpoint_sha256"]:
@@ -165,7 +166,7 @@ def load_examples(reference: Path) -> tuple[list, dict]:
                          "metrics": metrics, "thresholds": provenance["thresholds"],
                          "contact_map_sha256": truth_hash})
     provenance.update(input_sha256=input_hashes, checkpoints=checkpoints,
-                      threshold_selection="Each model uses its frozen validation-macro-F1 threshold.",
+                      threshold_selection="Each model uses its frozen validation F1 threshold.",
                       ap_note="AUPRC is preserved from the hashed continuous-score analysis tables; "
                               "binary-map confusion counts and F1 are independently recomputed.")
     return examples, provenance

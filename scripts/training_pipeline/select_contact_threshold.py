@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
-"""Select one contact cutoff per frozen checkpoint using validation macro F1.
+"""Select one contact cutoff per frozen checkpoint using validation F1.
 
 Restore the original model and padded batches, evaluate every known cell of
 real structural maps, and search all distinct validation decisions. Save the
-cutoff before test inference. Report per-map and pooled metrics at 0.5 and at
-the frozen cutoff, alongside threshold-independent contact AP. No training or
-interaction-threshold changes occur. Raw known-cell scores are cached so the
+cutoff before test inference. Report metrics averaged equally over maps at 0.5
+and at the frozen cutoff, alongside threshold-independent contact AP. No training
+or interaction-threshold changes occur. Raw known-cell scores are cached so the
 contact analysis is reproducible without another model forward pass.
 """
 
@@ -123,15 +123,12 @@ def collect_contacts(pipeline, data, model, dataset, device, output_dir, split,
 
 
 def summarize_contacts(maps, rows, threshold, output_path):
-    """Report exact macro AP and 4096-bin micro AP, plus both binary cutoffs.
+    """Report exact AP and both binary cutoffs, averaging each metric over maps.
 
-    Macro metrics average map-level ratios equally. Micro metrics use a single
-    split-wide confusion matrix, unlike historical batch-averaged diagnostics.
+    Each nonempty map has the same weight regardless of its known-cell count.
     Undefined precision/recall/F1 and AP for all-negative maps are zero.
     """
     decisions = {"at_0.5": [], "at_selected_threshold": []}
-    positive_bins = np.zeros(4096, dtype=np.int64)
-    negative_bins = np.zeros(4096, dtype=np.int64)
     report_rows = []
     for (labels, scores), metadata in zip(maps, rows):
         row = dict(metadata)
@@ -141,22 +138,12 @@ def summarize_contacts(maps, rows, threshold, output_path):
             decisions[name].append(metrics)
             row.update({f"{name}_{key}": value for key, value in metrics.items()})
         report_rows.append(row)
-        # Match BinnedBinaryAveragePrecision's float32 bin assignment, including
-        # clamping probability 1 into the final bin. Unknown cells were removed.
-        bins = np.minimum((scores * 4096).astype(np.int64), 4095)
-        positive_bins += np.bincount(bins[labels == 1], minlength=4096)
-        negative_bins += np.bincount(bins[labels == 0], minlength=4096)
-    tp = np.cumsum(positive_bins[::-1], dtype=np.float64)
-    predicted = tp + np.cumsum(negative_bins[::-1])
-    precision = np.divide(tp, predicted, out=np.zeros_like(tp), where=predicted > 0)
-    micro_ap = float(np.sum(precision * positive_bins[::-1]) / max(1, positive_bins.sum()))
     with output_path.open("w", newline="") as handle:
         writer = csv.DictWriter(handle, fieldnames=list(report_rows[0]), delimiter="\t")
         writer.writeheader()
         writer.writerows(report_rows)
     return {**{name: aggregate_contact_metrics(values) for name, values in decisions.items()},
-            "contact_auprc_macro": float(np.mean([row["auprc"] for row in report_rows])),
-            "contact_auprc_micro": micro_ap}
+            "contact_auprc": float(np.mean([row["auprc"] for row in report_rows]))}
 
 
 # =============================================================================
@@ -179,7 +166,7 @@ def main():
     parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--num-workers", type=int, default=4)
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--selection-metric", choices=("macro_f1", "micro_f1", "micro_accuracy"), default="macro_f1")
+    parser.add_argument("--selection-metric", choices=("f1",), default="f1")
     parser.add_argument("--sample-count", type=int, default=5)
     parser.add_argument("--verification-atol", type=float, default=1e-4)
     args = parser.parse_args()
@@ -246,7 +233,7 @@ def main():
         "float32_matmul_precision": torch.get_float32_matmul_precision(),
         "torch_version": torch.__version__, "numpy_version": np.__version__,
         "eligibility": "Real structural maps with known cells; -1 unknown/padding and synthetic maps excluded",
-        "zero_division": 0, "micro_ap_bins": 4096,
+        "zero_division": 0, "metric_aggregation": "Equal average over nonempty structural maps",
         "historical_contact_map_hashes_available": False,
     }
     args.output_dir.mkdir(parents=True)
@@ -258,8 +245,7 @@ def main():
     threshold, curve, search_metadata = search.select(args.selection_metric)
     validation = summarize_contacts(validation_maps, validation_rows, threshold,
                                     args.output_dir / "validation_maps.tsv")
-    aggregation, metric = args.selection_metric.split("_")
-    actual_objective = validation["at_selected_threshold"][aggregation][metric]
+    actual_objective = validation["at_selected_threshold"][args.selection_metric]
     if not np.isclose(actual_objective, search_metadata["selected_objective_value"], rtol=0, atol=1e-12):
         raise RuntimeError("Selected search objective disagrees with independent fixed-cutoff evaluation")
     validation["exclusions"] = exclusions
@@ -274,9 +260,9 @@ def main():
         writer = csv.DictWriter(handle, fieldnames=list(curve[0]), delimiter="\t")
         writer.writeheader()
         writer.writerows(curve)
-    print(f"Frozen contact threshold {threshold:.17g}; validation macro F1 "
-          f"{validation['at_0.5']['macro']['f1']:.6f} -> "
-          f"{validation['at_selected_threshold']['macro']['f1']:.6f}", flush=True)
+    print(f"Frozen contact threshold {threshold:.17g}; validation F1 "
+          f"{validation['at_0.5']['f1']:.6f} -> "
+          f"{validation['at_selected_threshold']['f1']:.6f}", flush=True)
     del search, validation_maps
 
     test_path = (args.test_predictions or args.checkpoint.parent.parent / "test_predictions.tsv").resolve(strict=True)
@@ -300,9 +286,9 @@ def main():
                "test_predictions": str(test_path), "test_predictions_sha256": sha256(test_path),
                "output_sha256": {path.name: sha256(path) for path in args.output_dir.iterdir() if path.is_file()}}
     (args.output_dir / "summary.json").write_text(json.dumps(summary, indent=2) + "\n")
-    print(f"Test macro F1 {test['at_0.5']['macro']['f1']:.6f} -> "
-          f"{test['at_selected_threshold']['macro']['f1']:.6f}; "
-          f"macro contact AP {test['contact_auprc_macro']:.6f}", flush=True)
+    print(f"Test F1 {test['at_0.5']['f1']:.6f} -> "
+          f"{test['at_selected_threshold']['f1']:.6f}; "
+          f"contact AP {test['contact_auprc']:.6f}", flush=True)
 
 
 if __name__ == "__main__":

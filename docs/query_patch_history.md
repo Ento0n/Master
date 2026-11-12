@@ -1,13 +1,13 @@
-# Query-Patch Model History and Sweep Index
+# QUERY-PATCH Model History and Sweep Index
 
-Last reviewed: 2026-09-09
+Historical experiment review: 2026-09-09. Metric names updated: 2026-11-12.
 
 Artifact paths updated: 2026-09-15. Results and logs now use matching sweep
 folders. Original path strings inside historical logs and submission records
 remain unchanged; the [migration map](../jobs/training_pipeline/artifact_index/moves.json)
 maps those recorded paths to their current locations.
 
-This document records how the query-patch model evolved and maps each experimental
+This document records how the QUERY-PATCH model evolved and maps each experimental
 stage to the `max_epochs` value used to identify its artifacts under
 [`jobs/training_pipeline/results`](../jobs/training_pipeline/results). It covers
 architecture, training objectives, evaluation changes, and the sweeps used to test
@@ -21,7 +21,7 @@ through the training CLI. All four support either `--int-mod-type normal` or
 
 | Thesis variant | CLI settings |
 |---|---|
-| D-SCRIPT | `--model dscript` |
+| Adapted D-SCRIPT | `--model dscript` |
 | QP-Additive | `--model query_patch --query-evidence-mode additive --compatibility-head bilinear` |
 | QP-Bilin-IC | `--model query_patch --query-evidence-mode gated --compatibility-head bilinear` |
 | QP-Conv-IC | `--model query_patch --query-evidence-mode gated --compatibility-head dscript` |
@@ -77,7 +77,7 @@ sbatch jobs/training_pipeline/prostt5_model_comparison.sh
 sbatch --array=0-9%4 jobs/training_pipeline/prostt5_model_comparison.sh
 ```
 
-Tasks `0/1`, `2/3`, `4/5`, and `6/7` correspond to D-SCRIPT, QP-Additive,
+Tasks `0/1`, `2/3`, `4/5`, and `6/7` correspond to adapted D-SCRIPT, QP-Additive,
 QP-Bilin-IC, and QP-Conv-IC; optional tasks `8/9` add QP-Additive-Conv. Even task
 IDs use `normal`, odd IDs use `max`. The script uses the pipeline defaults for
 `omega=0.5`, interaction weight `0.5`, and four queries. It explicitly sets a
@@ -90,19 +90,20 @@ and W&B runs are grouped as `prostt5-<array-job-id>`.
 
 ## Current Model at a Glance
 
-The query-patch model reuses the D-SCRIPT residue projection and interaction-pooling
-heads, but replaces the D-SCRIPT contact-map generator with learned query patches.
+The QUERY-PATCH model reuses the adapted D-SCRIPT residue projection and interaction-pooling
+heads, but replaces the adapted D-SCRIPT contact-map generator with learned query patches.
 For one protein pair, the default gated design is:
 
-1. Project both proteins' residue embeddings with the shared D-SCRIPT projection.
+1. Project both proteins' residue embeddings with the shared adapted D-SCRIPT projection.
 2. Let learned queries attend jointly to the two projected proteins.
 3. Decode one soft residue mask on each protein and a positive strength per query.
 4. Combine matched masks into residue-pair query evidence.
 5. Convert that evidence into a soft gate over residue pairs.
-6. Predict residue-pair compatibility with a signed low-rank bilinear head.
+6. Predict residue-pair compatibility with the convolutional head by default, or
+   a signed low-rank bilinear head when selected.
 7. Compute the final contact probability as
    `sigmoid(query_gate_logits) * sigmoid(compatibility_contact_logits)`.
-8. Pool the resulting contact map with the inherited D-SCRIPT interaction head.
+8. Pool the resulting contact-map with the inherited adapted D-SCRIPT interaction head.
 
 The product in step 7 makes query evidence a prerequisite: the compatibility branch
 cannot predict a high contact probability where the query gate is closed. The main
@@ -124,11 +125,11 @@ query produced:
 - a non-negative patch strength.
 
 The masks were combined efficiently as a sum of rank-one patches:
-`A^T diag(strength) B / sqrt(K) + contact_bias`. This generated a dense contact map
+`A^T diag(strength) B / sqrt(K) + contact_bias`. This generated a dense contact-map
 without materializing a `[batch, queries, length_1, length_2]` tensor. The existing
-D-SCRIPT projection and interaction heads remained in use.
+adapted D-SCRIPT projection and interaction heads remained in use.
 
-This stage was tested by the **max-97 query-patch sweep**.
+This stage was tested by the **max-97 QUERY-PATCH sweep**.
 
 ### 2. Additive signed compatibility branch
 
@@ -146,7 +147,7 @@ bilinear branch was therefore added:
 The contact logits became
 `query_evidence + scale * compatibility_evidence + contact_bias`.
 
-This stage was tested by the **max-96 query-patch sweep**.
+This stage was tested by the **max-96 QUERY-PATCH sweep**.
 
 ### 3. Fixed and normalized compatibility
 
@@ -162,7 +163,7 @@ Fixing the scale prevented training from silently disabling the compatibility
 branch. The sweep still included scale `0` as an explicit query-only ablation,
 alongside scales `1`, `2`, `5`, `10`, and `20`.
 
-This stage was tested by the broad **max-95 query-patch sweep**.
+This stage was tested by the broad **max-95 QUERY-PATCH sweep**.
 
 ### 4. Class-balanced contact objectives
 
@@ -176,7 +177,7 @@ contact-map objectives were introduced:
 - `balanced_bce_dice`, which adds a soft Dice term.
 
 The positive-class weight is controlled by `omega`. These losses were tested on
-both query patch and D-SCRIPT so that loss effects could be separated from
+both QUERY-PATCH and adapted D-SCRIPT so that loss effects could be separated from
 architecture effects.
 
 They were tested first by the **max-94 fixed grid**, then by the **max-93 Bayesian
@@ -223,11 +224,11 @@ This redesigned objective was tested by the **max-91 auxiliary-loss sweep**.
 
 **Commit:** `b26a7e9` — 2026-08-20
 
-Interaction AUPRC plus macro and micro contact AUPRC were added. These metrics are
-more informative than thresholded accuracy for sparse contact maps:
-
-- macro contact AUPRC gives each supervised complex equal influence; and
-- micro contact AUPRC pools all known residue-pair cells.
+Interaction AUPRC and two contact AUPRC calculations were added at this stage:
+AP averaged equally over structural complexes and AP over all known residue-pair
+cells combined. The current implementation retains the equal-complex calculation
+as `val_contact_auprc` and `test_contact_auprc`. It no longer computes the combined
+residue-pair score.
 
 ### 8. Separate interface and contact class balance
 
@@ -239,9 +240,9 @@ Interface residues are much denser than residue-pair contacts, so the single
 - `interface_omega`, defaulting to `0.2`, for chain-wise interface BCE; and
 - `omega` for final and compatibility contact-map BCE.
 
-This commit also changed query-patch checkpointing and sweep selection to maximize
-macro validation contact AUPRC, and changed the pipeline's default query count from
-32 to 4. The max-91 grid fixes `interface_omega=0.2` while varying both interface
+This commit also changed QUERY-PATCH checkpointing and sweep selection to maximize
+validation contact AUPRC averaged equally over maps, and changed the pipeline's
+default query count from 32 to 4. The max-91 grid fixes `interface_omega=0.2` while varying both interface
 loss weight and contact `omega`.
 
 ## Sweep and Result-Directory Index
@@ -255,8 +256,8 @@ ended training earlier.
 | 97 | 2026-08-03/04 | `3i1q6nkt` | `6432851` | Bayesian initial query-decoder search without compatibility. Varied interaction head, query count, heads, layers, dropout, and contact bias. | `query_patch_architecture_sweep_3i1q6nkt/querypatch-*_97` | 28 runs, 20 unique directories |
 | 96 | 2026-08-04/05 | `9833yis3` | `6433993` | Bayesian additive-compatibility search. Added compatibility rank and trainable scale initialization. | `query_patch_compatibility_scale_sweep_9833yis3/querypatch-*_96` | 60 directories |
 | 95 | 2026-08-06 onward | `uhjcq9sp` | `6453061` | Broad Bayesian fixed-compatibility search over five loss types, query architecture, dropout, bias, rank, scale, and interaction head. | `query_patch_additive_sweep_uhjcq9sp/95_model=query_patch_*` | 230 directories; 226 completed, 4 partial |
-| 94 | 2026-08-12 | `v6bjofvo` | `6504538` | Fixed grid: query patch vs. D-SCRIPT, balanced BCE vs. balanced BCE + Dice, max vs. normal interaction head, `omega=0.5`. | `balanced_loss_head_sweep_v6bjofvo/94_model=query_patch_*` | 4 query-patch / 8 total |
-| 93 | 2026-08-13/14 | `k7vtr11y` | `6507382` | Bayesian continuation of max 94, now varying `omega` uniformly from `0.2` to `0.8`. | `balanced_loss_omega_sweep_k7vtr11y/93_model=query_patch_*` | 12 query-patch / 28 total |
+| 94 | 2026-08-12 | `v6bjofvo` | `6504538` | Fixed grid: QUERY-PATCH vs. adapted D-SCRIPT, balanced BCE vs. balanced BCE + Dice, max vs. normal interaction head, `omega=0.5`. | `balanced_loss_head_sweep_v6bjofvo/94_model=query_patch_*` | 4 QUERY-PATCH / 8 total |
+| 93 | 2026-08-13/14 | `k7vtr11y` | `6507382` | Bayesian continuation of max 94, now varying `omega` uniformly from `0.2` to `0.8`. | `balanced_loss_omega_sweep_k7vtr11y/93_model=query_patch_*` | 12 QUERY-PATCH / 28 total |
 | 92 | 2026-08-17 | `7pu2koy9` | `6529755` | Grid over direct pairwise gate-loss weight `[0, 0.05, 0.2, 0.5]` and gate bias `[-2, 0]`. | `query_patch_gate_sweep_7pu2koy9/92_model=query_patch_*qgatew=*` | 8 directories |
 | 91 | 2026-08-20 | `11zro799` | `6548787` | `5 x 5` grid over interface-loss weight `[0, 0.05, 0.2, 0.5, 1]` and contact `omega` `[0.02, 0.05, 0.1, 0.2, 0.5]`, with `interface_omega=0.2`. | `query_patch_interface_sweep_11zro799/91_model=query_patch_*qifw=*ifomega=0.2*` | 25 directories |
 
@@ -318,9 +319,11 @@ directory marker, not the progress-bar denominator, when identifying a sweep.
 - The max-95 SLURM script allowed 280 array entries, but only 230 run logs/result
   directories are present; four of those directories are partial.
 - Historical max-97 through max-92 runs selected and early-stopped on validation
-  loss. The max-91 runs selected on macro validation contact AUPRC. The current
-  YAML files were later updated to the AUPRC objective and therefore do not
-  reproduce every historical sweep exactly.
+  loss. The max-91 runs selected on validation contact AUPRC averaged equally over
+  maps. The archived YAML files were later updated to the AUPRC objective and
+  therefore do not reproduce every historical sweep exactly. Current training
+  defaults to validation interaction AUPRC for adapted D-SCRIPT and QUERY-PATCH;
+  contact-based selection requires `--selection-monitor val_contact_auprc`.
 
 ## Fixed Runs That Were Not Sweeps
 
@@ -337,7 +340,7 @@ compatibility head:
 
 - `bilinear` retains the signed low-rank compatibility head used by the historical
   sweeps; and
-- `dscript` applies the local pairwise D-SCRIPT convolutional contact module before
+- `dscript` applies the local pairwise adapted D-SCRIPT convolutional contact module before
   the same query gate.
 
 The option is exposed as `--compatibility-head {bilinear,dscript}`. No tracked
@@ -347,7 +350,7 @@ once the alternative is tested.
 
 ## Updating This Overview
 
-For each future query-patch generation, record:
+For each future QUERY-PATCH generation, record:
 
 1. the commit hash and architectural or objective change;
 2. the W&B sweep ID and SLURM array job ID;

@@ -1,8 +1,8 @@
 #!/usr/bin/env python
 """Train protein interaction models with PyTorch Lightning.
 
-The default model is a D-SCRIPT-style architecture trained jointly on pair-level
-interaction labels and available residue contact maps.
+The default model is an adapted D-SCRIPT architecture trained jointly on pair-level
+interaction labels and available residue contact-maps.
 """
 
 from __future__ import annotations
@@ -33,7 +33,7 @@ if not __package__:
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.models import DScriptInteractionModel, FullyConnectedInteractionModel, QueryPatchInteractionModel
 from scripts.training_pipeline.losses import balanced_binary_cross_entropy_per_map
-from scripts.training_pipeline.metrics import BinnedBinaryAveragePrecision, MacroContactAveragePrecision
+from scripts.training_pipeline.metrics import ContactAveragePrecision, ContactMetricMean
 
 
 # =============================================================================
@@ -61,12 +61,12 @@ DEFAULT_OUTPUT_DIR = Path("/nfs/home/students/a.spannagl/master_repository/jobs/
 CONTACT_MAP_SAMPLE_COUNT = 5
 
 # Contact-map models now select checkpoints by interaction AUPRC by default.
-# Contact-focused sweeps explicitly override this with macro contact AUPRC.
+# Contact-focused sweeps explicitly override this with contact AUPRC.
 MONITOR = "val_interaction_auprc"
 SELECTION_METRIC_MODES = {
     "val_loss": "min",
     "val_interaction_auprc": "max",
-    "val_contact_auprc_macro": "max",
+    "val_contact_auprc": "max",
 }
 
 
@@ -151,7 +151,7 @@ def parse_args() -> argparse.Namespace:
     evaluation.add_argument(
         "--selection-tiebreaker",
         choices=tuple(SELECTION_METRIC_MODES),
-        default="val_contact_auprc_macro",
+        default="val_contact_auprc",
         help=(
             "Optional secondary validation metric to report from the checkpoint "
             "selected by --selection-monitor. It does not alter checkpointing. "
@@ -191,29 +191,29 @@ def parse_args() -> argparse.Namespace:
     baseline.add_argument("--dropout", type=float, default=0.2, help="Fully connected baseline dropout.")
 
     # =========================================================================
-    # D-SCRIPT and Query Patch: data and projection
+    # D-SCRIPT and QUERY-PATCH: data and projection
     # =========================================================================
-    shared = parser.add_argument_group('D-SCRIPT and Query Patch: data and projection')
+    shared = parser.add_argument_group('D-SCRIPT and QUERY-PATCH: data and projection')
     shared.add_argument(
         "--embedding-manifest",
         type=Path,
         default=DEFAULT_EMBEDDING_MANIFEST,
-        help="Embedding manifest with per_residue_path entries for D-SCRIPT and Query Patch.",
+        help="Embedding manifest with per_residue_path entries for D-SCRIPT and QUERY-PATCH.",
     )
     shared.add_argument(
         "--contact-map-dir",
         type=Path,
         default=DEFAULT_CONTACT_MAP_DIR,
-        help="Directory containing <pdb_id>-assembly<assembly_number>.npy contact maps.",
+        help="Directory containing <pdb_id>-assembly<assembly_number>.npy contact-maps.",
     )
-    shared.add_argument("--embedding-dim", type=int, default=1280, help="Per-residue embedding size for D-SCRIPT and Query Patch.")
-    shared.add_argument("--projection-dim", type=int, default=100, help="Projected residue size for D-SCRIPT and Query Patch.")
-    shared.add_argument("--projection-dropout", type=float, default=0.5, help="Projection dropout for D-SCRIPT and Query Patch.")
+    shared.add_argument("--embedding-dim", type=int, default=1280, help="Per-residue embedding size for D-SCRIPT and QUERY-PATCH.")
+    shared.add_argument("--projection-dim", type=int, default=100, help="Projected residue size for D-SCRIPT and QUERY-PATCH.")
+    shared.add_argument("--projection-dropout", type=float, default=0.5, help="Projection dropout for D-SCRIPT and QUERY-PATCH.")
 
     # =========================================================================
-    # D-SCRIPT and Query Patch: losses and contact metrics
+    # D-SCRIPT and QUERY-PATCH: losses and contact metrics
     # =========================================================================
-    losses = parser.add_argument_group('D-SCRIPT and Query Patch: losses and contact metrics')
+    losses = parser.add_argument_group('D-SCRIPT and QUERY-PATCH: losses and contact metrics')
     losses.add_argument(
         "--loss-mode",
         choices=("auto", "basic", "dimer_type"),
@@ -231,7 +231,7 @@ def parse_args() -> argparse.Namespace:
         type=str,
         choices=("contact", "sparsity_11", "sparsity_12", "sparsity_21", "sparsity_22", "balanced_bce", "balanced_bce_dice"),
         default="balanced_bce",
-        help="Which loss type to apply for the contact map")
+        help="Which loss type to apply for the contact-map")
     losses.add_argument(
         "--omega",
         default=0.5,
@@ -251,9 +251,9 @@ def parse_args() -> argparse.Namespace:
     )
 
     # =========================================================================
-    # D-SCRIPT and Query Patch: interaction head
+    # D-SCRIPT and QUERY-PATCH: interaction head
     # =========================================================================
-    interaction = parser.add_argument_group('D-SCRIPT and Query Patch: interaction head')
+    interaction = parser.add_argument_group('D-SCRIPT and QUERY-PATCH: interaction head')
     interaction.add_argument("--int-mod-type", default="normal", type=str, choices=("normal", "max"), help="Interaction readout: normal D-SCRIPT pooling or maximum contact logit.")
     interaction.add_argument("--trainable-final-slope", action="store_true", default=True, help="DScript Interaction module slope applied.")
     interaction.add_argument("--gamma-init", type=float, default=0.0, help="DScript gamma parameter of interaction module, (gamma*variance)-mean as threshold of high contacts.")
@@ -262,14 +262,14 @@ def parse_args() -> argparse.Namespace:
     # =========================================================================
     # D-SCRIPT contact head
     # =========================================================================
-    dscript = parser.add_argument_group('D-SCRIPT contact head', description='Also used by Query Patch when --compatibility-head=dscript.')
+    dscript = parser.add_argument_group('D-SCRIPT contact head', description='Also used by QUERY-PATCH when --compatibility-head=dscript.')
     dscript.add_argument("--contact-hidden-dim", type=int, default=50, help="D-SCRIPT contact module hidden channels.")
     dscript.add_argument("--contact-width", type=int, default=7, help="Odd convolution width for contact prediction.")
 
     # =========================================================================
-    # Query Patch: decoder and compatibility
+    # QUERY-PATCH: decoder and compatibility
     # =========================================================================
-    query = parser.add_argument_group('Query Patch: decoder and compatibility')
+    query = parser.add_argument_group('QUERY-PATCH: decoder and compatibility')
     query.add_argument(
         "--num-interaction-queries",
         type=int,
@@ -325,7 +325,7 @@ def parse_args() -> argparse.Namespace:
         "--query-gate-bias-init",
         type=float,
         default=0.0,
-        help="Initial logit bias of the query-patch compatibility gate (gated mode only).",
+        help="Initial logit bias of the QUERY-PATCH compatibility gate (gated mode only).",
     )
     query.add_argument(
         "--query-interface-loss-weight",
@@ -362,8 +362,8 @@ def validate_args(args: argparse.Namespace) -> None:
     selection_monitor = resolve_selection_monitor(args.model, args.selection_monitor)
     if args.selection_tiebreaker == selection_monitor:
         raise ValueError("--selection-tiebreaker must differ from --selection-monitor")
-    if args.model == "fully_connected" and args.selection_tiebreaker == "val_contact_auprc_macro":
-        raise ValueError("The fully_connected model does not produce val_contact_auprc_macro")
+    if args.model == "fully_connected" and args.selection_tiebreaker == "val_contact_auprc":
+        raise ValueError("The fully_connected model does not produce val_contact_auprc")
 
     # The threshold is used for metrics only. The contact-map loss uses the raw
     # logits directly because thresholding would make the loss non-differentiable.
@@ -380,7 +380,7 @@ def validate_args(args: argparse.Namespace) -> None:
     if not 0.0 <= args.interface_omega <= 1.0:
         raise ValueError("--interface-omega must be in [0, 1]")
 
-    # Query-patch attention operates in the projected residue dimension. Multi-
+    # QUERY-PATCH attention operates in the projected residue dimension. Multi-
     # head attention splits that dimension evenly across heads, and at least one
     # learned query/decoder layer is required to construct contact patches.
     if args.model == "query_patch":
@@ -399,7 +399,7 @@ def validate_args(args: argparse.Namespace) -> None:
 def resolve_selection_monitor(model_name: str, requested_monitor: str) -> str:
     """Resolve the checkpoint metric while preserving model-specific defaults.
 
-    Fully connected models do not produce contact maps, so macro contact AUPRC
+    Fully connected models do not produce contact-maps, so contact AUPRC
     is invalid for them. D-SCRIPT and QUERY-PATCH expose all three configured
     metrics and default to validation interaction AUPRC.
     """
@@ -407,8 +407,8 @@ def resolve_selection_monitor(model_name: str, requested_monitor: str) -> str:
         monitor = "val_loss" if model_name == "fully_connected" else MONITOR
     else:
         monitor = requested_monitor
-    if model_name == "fully_connected" and monitor == "val_contact_auprc_macro":
-        raise ValueError("The fully_connected model does not produce val_contact_auprc_macro")
+    if model_name == "fully_connected" and monitor == "val_contact_auprc":
+        raise ValueError("The fully_connected model does not produce val_contact_auprc")
     return monitor
 
 
@@ -426,7 +426,7 @@ def split_pair(value: object, column_name: str) -> tuple[str, str]:
 def add_interaction_weights(examples: pd.DataFrame, loss_mode: str) -> pd.DataFrame:
     """Add per-example interaction BCE weights."""
     # Interaction weights affect only the pair-level BCE. They do not affect
-    # contact-map supervision, because contact maps have their own per-cell BCE.
+    # contact-map supervision, because contact-maps have their own per-cell BCE.
     train_df = examples[examples["split"] == "train"]
     if train_df.empty:
         raise ValueError("No training rows found. Expected split column to contain 'train'.")
@@ -576,9 +576,8 @@ def save_auprc_plots(metrics_path: Path, output_dir: Path) -> None:
     Validation AUPRC is logged once per epoch and is therefore drawn as a
     conventional epoch curve. Test AUPRC is evaluated only once, after model
     selection, so it is shown as a horizontal reference instead of being
-    presented as an epoch series. The contact figure includes both aggregation
-    conventions: macro gives every structural complex equal weight, while micro
-    pools all known residue pairs and gives larger maps more influence.
+    presented as an epoch series. Contact AUPRC gives every structural
+    contact-map equal weight, independently of its number of known cells.
     """
     if not metrics_path.exists():
         print(f"Skipping AUPRC plots because metrics file does not exist: {metrics_path}")
@@ -750,12 +749,10 @@ def save_auprc_plots(metrics_path: Path, output_dir: Path) -> None:
     )
     save_metric_figure(
         validation_specs=(
-            ("val_contact_auprc_macro", "Validation Macro AUPRC", "#1B7837"),
-            ("val_contact_auprc_micro", "Validation Micro AUPRC", "#2166AC"),
+            ("val_contact_auprc", "Validation AUPRC", "#1B7837"),
         ),
         test_specs=(
-            ("test_contact_auprc_macro", "Macro AUPRC", "#00441B"),
-            ("test_contact_auprc_micro", "Micro AUPRC", "#053061"),
+            ("test_contact_auprc", "AUPRC", "#00441B"),
         ),
         title="Contact-map AUPRC by Epoch",
         output_path=output_dir / "contact_auprc_history.png",
@@ -993,7 +990,7 @@ class FullyConnectedLightningModule(pl.LightningModule):
 
 
 class DScriptDataset(Dataset):
-    """Dataset that loads per-residue embeddings and optional true contact maps."""
+    """Dataset that loads per-residue embeddings and optional true contact-maps."""
 
     def __init__(self, examples: pd.DataFrame) -> None:
         self.examples = examples.reset_index(drop=True)
@@ -1003,7 +1000,7 @@ class DScriptDataset(Dataset):
         return len(self.examples)
 
     def __getitem__(self, index: int) -> dict[str, object]:
-        """Load embedding tensors and a true contact map when available."""
+        """Load embedding tensors and a true contact-map when available."""
         row = self.examples.iloc[index]
 
         # Embeddings are stored as one tensor per cluster/entity:
@@ -1018,7 +1015,7 @@ class DScriptDataset(Dataset):
         else:
             embedding_2 = self.load_embedding(Path(row.embedding_path_2))
 
-        # Positive examples should have a real contact map. Negative examples
+        # Positive examples should have a real contact-map. Negative examples
         # usually do not; None is allowed and becomes an all -1 padded target.
         # When a map exists, its -1 cells later mask unresolved residue pairs out
         # of both contact supervision and interaction-score pooling.
@@ -1051,7 +1048,7 @@ class DScriptDataset(Dataset):
 
     @staticmethod
     def load_contact_map(path_value: object, residues_1: int, residues_2: int) -> torch.Tensor | None:
-        """Load one true contact map, preserving -1 as unknown."""
+        """Load one true contact-map, preserving -1 as unknown."""
         if pd.isna(path_value) or not str(path_value):
             return None
 
@@ -1063,7 +1060,7 @@ class DScriptDataset(Dataset):
         # protein 2. A mismatch would silently train on shifted/wrong labels.
         if contact_map.shape != (residues_1, residues_2):
             raise ValueError(
-                f"Contact map shape mismatch for {path}: got {contact_map.shape}, "
+                f"Contact-map shape mismatch for {path}: got {contact_map.shape}, "
                 f"expected {(residues_1, residues_2)}"
             )
 
@@ -1073,12 +1070,12 @@ class DScriptDataset(Dataset):
 
 
 def collate_dscript_batch(items: list[dict[str, object]], negative_contact_maps: bool) -> dict[str, torch.Tensor]:
-    """Pad variable-length embeddings and contact maps within one D-SCRIPT batch."""
+    """Pad variable-length embeddings and contact-maps within one D-SCRIPT batch."""
     batch_size = len(items)
     embedding_dim = items[0]["embedding_1"].shape[1]
 
     # Each batch is padded only to the largest protein lengths in that batch.
-    # This avoids a global max-length tensor and keeps contact maps much smaller.
+    # This avoids a global max-length tensor and keeps contact-maps much smaller.
     max_residues_1 = max(item["embedding_1"].shape[0] for item in items)
     max_residues_2 = max(item["embedding_2"].shape[0] for item in items)
 
@@ -1113,7 +1110,7 @@ def collate_dscript_batch(items: list[dict[str, object]], negative_contact_maps:
 
         contact_map = item["contact_map"]
         if contact_map is not None:
-            # Real contact maps are copied into the same top-left valid region.
+            # Real contact-maps are copied into the same top-left valid region.
             # Remaining cells stay -1 and are ignored by the loss. For examples
             # with structural supervision, interaction pooling uses only known
             # residue pairs, so unresolved -1 cells cannot become unconstrained
@@ -1121,13 +1118,13 @@ def collate_dscript_batch(items: list[dict[str, object]], negative_contact_maps:
             contact_maps[batch_index, :residues_1, :residues_2] = contact_map
             interaction_pair_masks[batch_index, :residues_1, :residues_2] = contact_map >= 0
         else:
-            # Examples without any contact map, usually synthetic/non-structural
+            # Examples without any contact-map, usually synthetic/non-structural
             # negatives, do not identify unresolved residues. Keep the previous
             # behavior and allow all real residue pairs to contribute to the
             # interaction objective for those examples.
             interaction_pair_masks[batch_index, :residues_1, :residues_2] = True
 
-            # if wanted, contact maps for negatives are matrices with 0s
+            # if wanted, contact-maps for negatives are matrices with 0s
             if negative_contact_maps:
                 contact_maps[batch_index, :residues_1, :residues_2] = 0.0
 
@@ -1213,9 +1210,9 @@ class DScriptDataModule(pl.LightningDataModule):
             preview = ", ".join(missing_clusters[:10])
             raise ValueError(f"Missing embeddings for {len(missing_clusters)} clusters. First examples: {preview}")
 
-        # Contact maps exist for real PDB assemblies. Negative examples can be
+        # Contact-maps exist for real PDB assemblies. Negative examples can be
         # synthetic/non-structural pairs and therefore may not have pdb_id or a
-        # contact map. Those rows simply receive no contact supervision.
+        # contact-map. Those rows simply receive no contact supervision.
         examples["contact_map_path"] = [
             self.resolve_contact_map_path(row.pdb_id, row.assembly_number) for row in examples.itertuples(index=False)
         ]
@@ -1227,7 +1224,7 @@ class DScriptDataModule(pl.LightningDataModule):
         missing_positive_maps = examples[(examples["label"] == 1) & examples["contact_map_path"].isna()]
         if not missing_positive_maps.empty:
             preview = missing_positive_maps[["pdb_id", "assembly_number"]].head(10).to_dict("records")
-            raise ValueError(f"Missing contact maps for {len(missing_positive_maps)} positive examples: {preview}")
+            raise ValueError(f"Missing contact-maps for {len(missing_positive_maps)} positive examples: {preview}")
 
         # The interaction objective still uses the same class/dimer-type weights
         # as the baseline. Contact-map loss is handled inside the LightningModule.
@@ -1254,11 +1251,11 @@ class DScriptDataModule(pl.LightningDataModule):
         return dict(zip(embedding_df["new_cluster_id"].astype(str), embedding_df["per_residue_path"].astype(str)))
 
     def resolve_contact_map_path(self, pdb_id: object, assembly_number: object) -> str | float:
-        """Resolve a row's real contact map path, or NaN when none exists."""
+        """Resolve a row's real contact-map path, or NaN when none exists."""
         if pd.isna(pdb_id) or pd.isna(assembly_number):
             return np.nan
 
-        # Contact maps are saved as e.g. "10bl-assembly1.npy". Lower-casing the
+        # Contact-maps are saved as e.g. "10bl-assembly1.npy". Lower-casing the
         # PDB id makes the lookup independent of TSV capitalization.
         path = self.contact_map_dir / f"{str(pdb_id).lower()}-assembly{int(assembly_number)}.npy"
         return str(path) if path.exists() else np.nan
@@ -1338,16 +1335,19 @@ class DScriptLightningModule(pl.LightningModule):
         self.omega = omega
 
         # Pair-level AUPRC is exact because validation/test contain only about a
-        # thousand examples. Contact evaluation is split into two complementary
-        # views: exact macro AP gives every structural complex equal weight,
-        # while streaming micro AP pools known residue pairs without retaining
-        # tens of millions of predictions in memory.
+        # thousand examples. Contact AP is evaluated exactly per structural
+        # map and averaged with equal weight for each map. Its state retains
+        # only the AP sum and map count, keeping memory independent of size.
         self.val_interaction_auprc = BinaryAveragePrecision()
         self.test_interaction_auprc = BinaryAveragePrecision()
-        self.val_contact_auprc_macro = MacroContactAveragePrecision()
-        self.test_contact_auprc_macro = MacroContactAveragePrecision()
-        self.val_contact_auprc_micro = BinnedBinaryAveragePrecision()
-        self.test_contact_auprc_micro = BinnedBinaryAveragePrecision()
+        self.val_contact_auprc = ContactAveragePrecision()
+        self.test_contact_auprc = ContactAveragePrecision()
+        # Threshold metrics retain map-weighted sums/counts for every stage.
+        # Register even empty updates on every worker so epoch synchronization
+        # remains consistent when a rank receives only unlabeled examples.
+        for stage in ("train", "val", "test"):
+            for metric_name in ("accuracy", "precision", "recall"):
+                setattr(self, f"{stage}_contact_{metric_name}", ContactMetricMean())
 
     def forward(
         self,
@@ -1381,7 +1381,7 @@ class DScriptLightningModule(pl.LightningModule):
         )
 
         # Pair-level interaction loss is computed for every row in the batch,
-        # including rows without a contact map. The optional weights come from
+        # including rows without a contact-map. The optional weights come from
         # dimer-type/label balancing in add_interaction_weights.
         per_example_interaction_loss = F.binary_cross_entropy_with_logits(
             interaction_logits,
@@ -1449,7 +1449,7 @@ class DScriptLightningModule(pl.LightningModule):
 
         batch_size = labels.size(0)
         # Keep stage_loss model-independent for checkpointing and mixed-model
-        # sweeps. Query-patch still optimizes the auxiliary term, which is
+        # sweeps. QUERY-PATCH still optimizes the auxiliary term, which is
         # reported separately as stage_optimization_loss below.
         self.log(
             f"{stage}_loss",
@@ -1527,8 +1527,7 @@ class DScriptLightningModule(pl.LightningModule):
                 batch,
             )
 
-        if contact_metrics["known_contacts"] > 0:
-            self.log_contact_metrics(stage, contact_metrics, batch_size)
+        self.log_contact_metrics(stage, contact_metrics)
 
         if stage == "test":
             log_test_accuracy_by_dimer_type(self, batch["dimer_type_index"], interaction_predictions, labels)
@@ -1545,11 +1544,9 @@ class DScriptLightningModule(pl.LightningModule):
     ) -> None:
         """Update split-wide interaction and structural contact AUPRC states.
 
-        Interaction AUPRC ranks complete protein pairs. Contact macro AUPRC
-        computes one AP per true structural map and then weights maps equally;
-        contact micro AUPRC pools all known residue pairs and consequently gives
-        larger maps more weight. The two contact summaries intentionally exclude
-        synthetic negative maps, even when those maps are enabled for training.
+        Interaction AUPRC ranks complete protein pairs. Contact AUPRC computes
+        one AP per true structural map and weights maps equally. Synthetic
+        negative maps are excluded, even when enabled for training.
         """
         interaction_metric = getattr(self, f"{stage}_interaction_auprc")
         interaction_metric.update(interaction_probabilities, interaction_labels.to(torch.long))
@@ -1564,35 +1561,19 @@ class DScriptLightningModule(pl.LightningModule):
         true_contact_map = batch["contact_map"]
         has_true_contact_map = batch["has_true_contact_map"]
 
-        # Unknown/unresolved and padded cells remain -1 and cannot enter either
-        # PR curve. Expanding the per-example structural flag across both map
-        # dimensions also removes optional synthetic all-zero negative maps.
-        contact_evaluation_mask = (true_contact_map >= 0) & has_true_contact_map[:, None, None]
-
-        macro_metric = getattr(self, f"{stage}_contact_auprc_macro")
-        macro_metric.update(
+        # Unknown/unresolved and padded cells remain -1 and cannot enter the
+        # PR curve. The structural flag excludes synthetic all-zero maps.
+        contact_metric = getattr(self, f"{stage}_contact_auprc")
+        contact_metric.update(
             contact_probabilities,
             true_contact_map,
             true_contact_map >= 0,
             has_true_contact_map,
         )
         self.log(
-            f"{stage}_contact_auprc_macro",
-            macro_metric,
+            f"{stage}_contact_auprc",
+            contact_metric,
             prog_bar=True,
-            on_step=False,
-            on_epoch=True,
-        )
-
-        micro_metric = getattr(self, f"{stage}_contact_auprc_micro")
-        micro_metric.update(
-            contact_probabilities[contact_evaluation_mask],
-            true_contact_map[contact_evaluation_mask].to(torch.long),
-        )
-        self.log(
-            f"{stage}_contact_auprc_micro",
-            micro_metric,
-            prog_bar=False,
             on_step=False,
             on_epoch=True,
         )
@@ -1613,14 +1594,18 @@ class DScriptLightningModule(pl.LightningModule):
         # Only cells with target >= 0 are supervised or counted in metrics.
         known_mask = true_contact_map >= 0
 
-        # If all contact maps are unknown, skip the rest
+        # If all contact-maps are unknown, skip the rest
         known_contacts = int(known_mask.sum().item())
         if known_contacts == 0:
             zero = contact_logits.new_tensor(0.0)
             return zero, {
-                "known_contacts": 0, 
-                "has_contact_supervision": torch.tensor(False, dtype=torch.bool, device=contact_logits.device)
-                }
+                "known_contacts": 0,
+                "evaluated_map_count": 0,
+                "contact_accuracy": zero,
+                "contact_precision": zero,
+                "contact_recall": zero,
+                "has_contact_supervision": torch.tensor(False, dtype=torch.bool, device=contact_logits.device),
+            }
 
         known_targets = true_contact_map[known_mask]
 
@@ -1633,20 +1618,25 @@ class DScriptLightningModule(pl.LightningModule):
         # For torch.where whethere only interaction or mixed loss
         has_contact_supervision = supervised_count > 0
         
-        # The threshold is used only for interpretable contact-map metrics. The
-        # differentiable loss above still trains on raw logits.
-        predicted_contacts = contact_probabilities[known_mask] >= self.contact_threshold
-        true_contacts = known_targets.bool()
-        contact_accuracy = (predicted_contacts == true_contacts).float().mean()
+        # Threshold metrics are computed independently for each [L1, L2] map,
+        # then averaged over maps with known cells. Optional synthetic zero
+        # maps remain included here because these metrics describe the targets
+        # used for supervision. Unknown/padded cells never contribute counts.
+        predicted_contacts = (contact_probabilities >= self.contact_threshold) & known_mask
+        true_contacts = true_contact_map == 1
+        correct_per_map = ((predicted_contacts == true_contacts) & known_mask).flatten(1).sum(1)
+        true_positive_per_map = (predicted_contacts & true_contacts).flatten(1).sum(1).float()
+        predicted_positive_per_map = predicted_contacts.flatten(1).sum(1).float()
+        actual_positive_per_map = true_contacts.flatten(1).sum(1).float()
+        accuracy_per_map = correct_per_map.float() / known_per_example.clamp_min(1)
 
-        # clamp_min(1.0) avoids NaN precision/recall in batches with no predicted
-        # positives or no actual positives. In those edge cases the numerator is
-        # zero, so the metric becomes zero.
-        true_positives = (predicted_contacts & true_contacts).sum().float()
-        predicted_positive = predicted_contacts.sum().float()
-        actual_positive = true_contacts.sum().float()
-        precision = true_positives / predicted_positive.clamp_min(1.0)
-        recall = true_positives / actual_positive.clamp_min(1.0)
+        # Precision/recall is zero for a map without predicted/actual positives.
+        # A map without known cells is excluded from every metric denominator.
+        precision_per_map = true_positive_per_map / predicted_positive_per_map.clamp_min(1.0)
+        recall_per_map = true_positive_per_map / actual_positive_per_map.clamp_min(1.0)
+        contact_accuracy = accuracy_per_map[supervised_examples].mean()
+        precision = precision_per_map[supervised_examples].mean()
+        recall = recall_per_map[supervised_examples].mean()
 
         if self.loss_type == "contact":
             # Contact loss
@@ -1685,7 +1675,7 @@ class DScriptLightningModule(pl.LightningModule):
                 # soft dice loss acts on probabilities!
                 probabilities = contact_probabilities.masked_fill(~known_mask, 0.0)
 
-                # sum over both contact map dimensions, one value per batch item
+                # sum over both contact-map dimensions, one value per batch item
                 map_dimensions = tuple(range(1, contact_logits.ndim)) # (1, 2) for [B, L1, L2]
 
                 soft_true_positives = (
@@ -1703,7 +1693,7 @@ class DScriptLightningModule(pl.LightningModule):
 
                 dice_loss_per_map = 1.0 - dice_coefficient
 
-                # Consider empty contact maps, averaging over number of maps with contacts
+                # Consider empty contact-maps, averaging over number of maps with contacts
                 maps_with_contacts = true_contact_mass > 0
                 maps_with_contacts_float = maps_with_contacts.to(dice_loss_per_map.dtype)
 
@@ -1765,6 +1755,7 @@ class DScriptLightningModule(pl.LightningModule):
             "has_contact_supervision": has_contact_supervision,
             "predicted_contacts": predicted_contacts,
             "known_contacts": known_contacts,
+            "evaluated_map_count": int(supervised_count.item()),
             "contact_accuracy": contact_accuracy,
             "contact_precision": precision,
             "contact_recall": recall,
@@ -1778,7 +1769,7 @@ class DScriptLightningModule(pl.LightningModule):
         """Return optional model-specific contact loss and diagnostics.
 
         The D-SCRIPT baseline has no auxiliary contact-head objective. Keeping
-        this hook in the shared training step lets query-patch add gate
+        this hook in the shared training step lets QUERY-PATCH add gate
         supervision without duplicating interaction pooling or the main loss.
         """
         del contact_aux
@@ -1788,33 +1779,22 @@ class DScriptLightningModule(pl.LightningModule):
         self,
         stage: str,
         metrics: dict[str, torch.Tensor | int],
-        batch_size: int,
     ) -> None:
-        """Log contact-map metrics computed with the configured threshold."""
-        self.log(
-            f"{stage}_contact_accuracy",
-            metrics["contact_accuracy"],
-            prog_bar=False,
-            on_step=False,
-            on_epoch=True,
-            batch_size=batch_size,
-        )
-        self.log(
-            f"{stage}_contact_precision",
-            metrics["contact_precision"],
-            prog_bar=False,
-            on_step=False,
-            on_epoch=True,
-            batch_size=batch_size,
-        )
-        self.log(
-            f"{stage}_contact_recall",
-            metrics["contact_recall"],
-            prog_bar=False,
-            on_step=False,
-            on_epoch=True,
-            batch_size=batch_size,
-        )
+        """Log threshold metrics with equal weight per evaluated map per epoch."""
+        # Weight each batch mean by its evaluated-map count, not the number of
+        # protein pairs or cells. Metric states sum across batches and workers;
+        # zero-count updates keep synchronization consistent for unlabeled ranks.
+        evaluated_map_count = metrics["evaluated_map_count"]
+        for metric_name in ("accuracy", "precision", "recall"):
+            metric = getattr(self, f"{stage}_contact_{metric_name}")
+            metric.update(metrics[f"contact_{metric_name}"], evaluated_map_count)
+            self.log(
+                f"{stage}_contact_{metric_name}",
+                metric,
+                prog_bar=False,
+                on_step=False,
+                on_epoch=True,
+            )
 
     def training_step(self, batch: dict[str, torch.Tensor], _batch_idx: int) -> torch.Tensor:
         """Train on one batch."""
@@ -1865,12 +1845,12 @@ class DScriptLightningModule(pl.LightningModule):
 
 
 # =============================================================================
-# Query-patch model wrapper
+# QUERY-PATCH model wrapper
 # =============================================================================
 
 
 class QueryPatchLightningModule(DScriptLightningModule):
-    """Reuse the established losses and metrics with the query-patch model.
+    """Reuse the established losses and metrics with the QUERY-PATCH model.
 
     The parent Lightning module remains the unchanged D-SCRIPT baseline. This
     subclass replaces only its inner model, keeping all experimental query
@@ -1957,7 +1937,7 @@ class QueryPatchLightningModule(DScriptLightningModule):
         contact_aux: dict[str, torch.Tensor],
         batch: dict[str, torch.Tensor],
     ) -> tuple[torch.Tensor, dict[str, tuple[torch.Tensor, int]]]:
-        """Apply branch supervision only to the gated query-patch variant."""
+        """Apply branch supervision only to the gated QUERY-PATCH variant."""
         # The original additive formulation learns both branches through the
         # final contact and interaction losses; it has no interface/gate targets
         # or separate compatibility BCE. Return a device/dtype-matched scalar.
@@ -2086,7 +2066,7 @@ def build_data_module_and_model(
         return data_module, model
 
     # D-SCRIPT is the default path. It reads per-residue embeddings and, where
-    # available, real contact maps from /nfs/scratch/pdb_dimers/contact_maps.
+    # available, real contact-maps from /nfs/scratch/pdb_dimers/contact_maps.
     data_module = DScriptDataModule(
         interaction_path=interaction_path,
         embedding_manifest=args.embedding_manifest,
@@ -2284,7 +2264,7 @@ def save_contact_map_png(
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
-    # Contact maps are categorical, not continuous:
+    # Contact-maps are categorical, not continuous:
     #   -1 = unknown/unresolved residue pair or padding,
     #    0 = known non-contact,
     #    1 = known contact.
@@ -2349,7 +2329,7 @@ def save_contact_map_png(
 def contact_map_sample_stem(row: pd.Series, sample_number: int, test_index: int) -> str:
     """Build a readable filename stem for one exported test contact-map sample."""
     # PDB/assembly ids are the clearest structural identifiers for D-SCRIPT
-    # contact maps. If they are unavailable, fall back to cluster ids and the
+    # contact-maps. If they are unavailable, fall back to cluster ids and the
     # original test-set row index.
     if "pdb_id" in row and pd.notna(row.pdb_id):
         assembly = f"_assembly{int(row.assembly_number)}" if pd.notna(row.get("assembly_number")) else ""
@@ -2368,16 +2348,16 @@ def save_test_contact_map_samples(
     output_dir: Path,
     sample_count: int = CONTACT_MAP_SAMPLE_COUNT,
 ) -> None:
-    """Save predicted and true contact maps for random test examples with labels."""
+    """Save predicted and true contact-maps for random test examples with labels."""
     if not isinstance(data_module.test_dataset, DScriptDataset) or not isinstance(model, DScriptLightningModule):
-        print("Skipping contact-map PNG export because this model does not produce residue contact maps")
+        print("Skipping contact-map PNG export because this model does not produce residue contact-maps")
         return
 
     test_dataset = data_module.test_dataset
     examples = test_dataset.examples
     candidates = examples.index[examples["contact_map_path"].notna()].to_numpy()
     if len(candidates) == 0:
-        print("Skipping contact-map PNG export because no test rows have true contact maps")
+        print("Skipping contact-map PNG export because no test rows have true contact-maps")
         return
 
     try:
@@ -2386,7 +2366,7 @@ def save_test_contact_map_samples(
         print(f"Skipping contact-map PNG export because matplotlib is not installed: {exc}")
         return
 
-    # Draw without replacement from test rows that have a true contact map. This
+    # Draw without replacement from test rows that have a true contact-map. This
     # avoids negative/synthetic rows where the contact target is entirely unknown
     # and therefore cannot be shown as a ground-truth map.
     sample_size = min(sample_count, len(candidates))
@@ -2424,12 +2404,12 @@ def save_test_contact_map_samples(
         save_contact_map_png(
             predicted_map,
             output_dir / f"{stem}_predicted_contact_map.png",
-            f"Predicted Contact Map (threshold >= {model.contact_threshold:g})",
+            f"Predicted Contact-Map (threshold >= {model.contact_threshold:g})",
         )
         save_contact_map_png(
             true_map,
             output_dir / f"{stem}_true_contact_map.png",
-            "True Contact Map",
+            "True Contact-Map",
         )
 
     print(f"Saved predicted and true contact-map PNGs for {sample_size} test examples to {output_dir}")
@@ -2495,7 +2475,7 @@ def main() -> None:
     selection_mode = SELECTION_METRIC_MODES[selection_monitor]
 
     # Build a compact, reproducible directory name from effective CLI arguments
-    # while still allowing an explicit --output-subdir override. Query-patch
+    # while still allowing an explicit --output-subdir override. QUERY-PATCH
     # names include every argument varied by its sweep, plus gamma/negative-map
     # settings because they also change model behavior or supervision. Keeping
     # max_epochs first makes result directories easy to group and compare.

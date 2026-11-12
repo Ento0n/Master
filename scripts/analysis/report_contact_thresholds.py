@@ -20,6 +20,11 @@ import json
 import math
 import statistics
 from pathlib import Path
+import sys
+
+if not __package__:
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from scripts.misc.contact_reporting import normalize_contact_summary
 
 
 DECISIONS = ("at_0.5", "at_selected_threshold")
@@ -114,10 +119,6 @@ def load_verified_run(summary_path: Path) -> tuple[dict, dict]:
     frozen = json.loads(frozen_path.read_text())
     if summary["output_sha256"].get("threshold.json") != hashlib.sha256(frozen_path.read_bytes()).hexdigest():
         raise ValueError(f"Frozen threshold hash mismatch: {frozen_path}")
-    # Archived analyses retain their original keys; CSV output names use the
-    # project's single convention of averaging metrics equally across maps.
-    if summary.get("selection_metric") != "macro_f1" or summary.get("selection_split") != "val":
-        raise ValueError(f"Expected a validation mean per-map F1 cutoff: {summary_path}")
     if "test" in frozen:
         raise ValueError(f"Frozen threshold record unexpectedly contains test metrics: {summary_path}")
     # The frozen file may predate validation output hashes, so compare every
@@ -128,6 +129,10 @@ def load_verified_run(summary_path: Path) -> tuple[dict, dict]:
     for key in ("threshold", "selection_metric", "selection_split", "checkpoint_sha256", "validation"):
         if key not in frozen:
             raise ValueError(f"Missing frozen threshold field: {summary_path}: {key}")
+    # Compare the original records above before adapting their names in memory.
+    summary = normalize_contact_summary(summary)
+    if summary["selection_split"] != "val" or summary["selection_metric"] != "f1":
+        raise ValueError(f"Expected a validation-selected contact F1 cutoff: {summary_path}")
     threshold = float(summary["threshold"])
     if not math.isfinite(threshold) or not 0 <= threshold <= math.nextafter(1.0, math.inf):
         raise ValueError(f"Invalid selected threshold: {summary_path}")
@@ -187,20 +192,25 @@ def load_verified_run(summary_path: Path) -> tuple[dict, dict]:
                 if int(recorded[key]) != value:
                     raise ValueError(f"Aggregate count mismatch: {table_path}: {decision}/{key}")
                 row[f"{split}_{key}"] = value
-            # Average each map's metric, so large maps do not receive extra
-            # weight. Keep the legacy input key only for result verification.
+            # Average each map's metric, so large maps do not receive extra weight.
             for key, values in metric_values.items():
                 value = statistics.fmean(values)
-                require_close(recorded["macro"][key], value, f"{table_path}: {decision}/{key}")
+                require_close(recorded[key], value, f"{table_path}: {decision}/{key}")
                 row[f"{split}_{decision}_{key}"] = value
         mean_ap = statistics.fmean(float(item["auprc"]) for item in maps)
-        contact_ap = float(split_summary["contact_auprc_macro"])
-        require_close(contact_ap, mean_ap, f"{table_path}: mean per-map AP")
-        if not math.isfinite(contact_ap) or not 0 <= contact_ap <= 1:
+        if "contact_auprc" in split_summary:
+            require_close(split_summary["contact_auprc"], mean_ap, f"{table_path}: mean per-map AP")
+        if not math.isfinite(mean_ap) or not 0 <= mean_ap <= 1:
             raise ValueError(f"Invalid contact AP: {table_path}")
-        row[f"{split}_contact_auprc"] = contact_ap
+        row[f"{split}_contact_auprc"] = mean_ap
     if row["validation_at_selected_threshold_f1"] + 1e-9 < row["validation_at_0.5_f1"]:
         raise ValueError(f"Selected validation F1 is below the included 0.5 baseline: {summary_path}")
+    search = summary["search"]
+    if (search["objective"] != "f1" or search.get("selection_is_exact") is not True
+            or int(search["n_maps"]) != row["validation_n_maps"]):
+        raise ValueError(f"Inconsistent contact F1 search metadata: {summary_path}")
+    require_close(search["selected_objective_value"], row["validation_at_selected_threshold_f1"],
+                  f"{summary_path}: selected validation F1")
     verification, cohorts["test_interactions"] = verify_saved_interaction_scores(summary, summary_path)
     row.update(verification)
     return row, cohorts
