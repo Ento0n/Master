@@ -4,7 +4,8 @@ from collections import defaultdict
 
 DATA_DIR = "/nfs/scratch/pdb_dimers"
 PARTITIONS_FILE = os.path.join(DATA_DIR, "KaHIP", "seq_ident_partitions_strong_output.txt")
-SEQUENCE_IDENTITY_GRAPH = os.path.join(DATA_DIR, "MMseqs2", "sequence_identity.graph")
+# Use the graph consumed by 08_KaHIP_partitioning.sh so node IDs match its output.
+SEQUENCE_IDENTITY_GRAPH = os.path.join(DATA_DIR, "graphs", "sequence_identity.graph")
 OUTPUT_FILE = os.path.join(DATA_DIR, "KaHIP", "partition_sequence_identity_summary_strong.tsv")
 
 

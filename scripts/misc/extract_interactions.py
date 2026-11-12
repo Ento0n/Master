@@ -1,7 +1,8 @@
 import pandas as pd
 
 def main():
-    interactions = pd.read_csv("/nfs/scratch/pdb_dimers/final_final_filtered_interactions_with_partitions_cd_hit.tsv", sep="\t")
+    # Export the positive pairs retained after CD-HIT filtering, before sampling negatives.
+    interactions = pd.read_csv("/nfs/scratch/pdb_dimers/dataset_iterations/07_cdhit.tsv", sep="\t")
 
     output = interactions[["uniprot_1", "uniprot_2"]].copy()
 

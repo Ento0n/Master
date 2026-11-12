@@ -12,6 +12,7 @@ import hashlib
 from pathlib import Path
 from functools import partial
 
+import sys
 import time
 
 import numpy as np
@@ -26,6 +27,10 @@ import lightning.pytorch as pl
 from lightning.pytorch.callbacks import ModelCheckpoint, EarlyStopping
 from lightning.pytorch.loggers import CSVLogger, WandbLogger
 
+# Support direct script execution as well as python -m without requiring a
+# caller-provided PYTHONPATH. Package imports retain the selected source root.
+if not __package__:
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.models import DScriptInteractionModel, FullyConnectedInteractionModel, QueryPatchInteractionModel
 from scripts.training_pipeline.losses import balanced_binary_cross_entropy_per_map
 from scripts.training_pipeline.metrics import BinnedBinaryAveragePrecision, MacroContactAveragePrecision

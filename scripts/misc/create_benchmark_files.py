@@ -17,8 +17,10 @@ from pathlib import Path
 
 
 parser = argparse.ArgumentParser()
-parser.add_argument("--interactions-tsv", default="/nfs/scratch/pdb_dimers/final_final_filtered_interactions_with_partitions_cd_hit.tsv")
-parser.add_argument("--entity-sequences-tsv", default="/nfs/scratch/pdb_dimers/entity_sequences.tsv")
+# Benchmark inputs are the positive CD-HIT-filtered pairs before negative
+# sampling and the entity sequences, now stored in separate data directories.
+parser.add_argument("--interactions-tsv", default="/nfs/scratch/pdb_dimers/dataset_iterations/07_cdhit.tsv")
+parser.add_argument("--entity-sequences-tsv", default="/nfs/scratch/pdb_dimers/sequences/entity_sequences.tsv")
 parser.add_argument("--outdir", default="/nfs/scratch/pdb_dimers/ppi_splitting_pipeline")
 parser.add_argument("--batch-size", type=int, default=100)
 parser.add_argument("--sleep", type=float, default=0.2)

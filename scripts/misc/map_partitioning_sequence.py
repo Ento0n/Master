@@ -4,10 +4,11 @@ import os
 import pandas as pd
 
 DATA_DIR = "/nfs/scratch/pdb_dimers"
+SEQUENCE_DIR = os.path.join(DATA_DIR, "sequences")
 
 def main():
     # Load the datasets
-    seqs_df = pd.read_csv(os.path.join(DATA_DIR, "unique_sequences.tsv"), sep="\t")
+    seqs_df = pd.read_csv(os.path.join(SEQUENCE_DIR, "unique_sequences.tsv"), sep="\t")
     mapping_df = pd.read_csv(os.path.join(DATA_DIR, "KaHIP", "cluster_id_mapping.tsv"), sep="\t")
     partition_df = pd.read_csv(os.path.join(DATA_DIR, "KaHIP", "output.txt"), header=None, names=["partition"])
 
@@ -27,7 +28,7 @@ def main():
     print(final_df.head())
 
     # Save the new dataframe with the cluster information
-    final_df.to_csv(os.path.join(DATA_DIR, "unique_sequences_with_partitioning.tsv"), sep="\t", index=False)
+    final_df.to_csv(os.path.join(SEQUENCE_DIR, "unique_sequences_with_partitioning.tsv"), sep="\t", index=False)
 
 if __name__ == "__main__":
     main()
