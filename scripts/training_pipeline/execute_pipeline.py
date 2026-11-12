@@ -55,10 +55,9 @@ DEFAULT_CONTACT_MAP_DIR = Path("/nfs/scratch/pdb_dimers/contact_maps/data")
 DEFAULT_OUTPUT_DIR = Path("/nfs/home/students/a.spannagl/master_repository/jobs/training_pipeline/results")
 CONTACT_MAP_SAMPLE_COUNT = 5
 
-# Contact-map models historically selected checkpoints by macro contact AUPRC.
-# The CLI can override this for controlled experiments whose primary endpoint is
-# interaction prediction, while leaving existing jobs unchanged by default.
-MONITOR = "val_contact_auprc_macro"
+# Contact-map models now select checkpoints by interaction AUPRC by default.
+# Contact-focused sweeps explicitly override this with macro contact AUPRC.
+MONITOR = "val_interaction_auprc"
 SELECTION_METRIC_MODES = {
     "val_loss": "min",
     "val_interaction_auprc": "max",
@@ -67,44 +66,31 @@ SELECTION_METRIC_MODES = {
 
 
 def parse_args() -> argparse.Namespace:
-    """Collect all command-line settings for data, model, and training."""
+    """Collect command-line settings in groups shared by the source and help output."""
     parser = argparse.ArgumentParser(description="Train a PDB dimer interaction model.")
-    parser.add_argument(
+
+    # =========================================================================
+    # General and output
+    # =========================================================================
+    general = parser.add_argument_group('General and output')
+    general.add_argument(
         "--model",
         choices=("dscript", "query_patch", "fully_connected"),
         help="Model family to train.",
     )
-    parser.add_argument(
-        "--interactions",
-        type=Path,
-        default=None,
-        help="Interaction TSV. Defaults to the strict TSV in /nfs/scratch/pdb_dimers.",
+    general.add_argument(
+        "--seed",
+        type=int,
+        default=42,
+        help="Random seed used by Python, NumPy, PyTorch, and DataLoader workers.",
     )
-    parser.add_argument(
-        "--sequence-file",
-        type=Path,
-        default=DEFAULT_SEQUENCE_FILE,
-        help="Entity sequence TSV for the fully_connected baseline.",
-    )
-    parser.add_argument(
-        "--embedding-manifest",
-        type=Path,
-        default=DEFAULT_EMBEDDING_MANIFEST,
-        help="Embedding manifest with per_residue_path entries for D-SCRIPT.",
-    )
-    parser.add_argument(
-        "--contact-map-dir",
-        type=Path,
-        default=DEFAULT_CONTACT_MAP_DIR,
-        help="Directory containing <pdb_id>-assembly<assembly_number>.npy contact maps.",
-    )
-    parser.add_argument(
+    general.add_argument(
         "--output-dir",
         type=Path,
         default=DEFAULT_OUTPUT_DIR,
         help="Where Lightning logs and checkpoints are written.",
     )
-    parser.add_argument(
+    general.add_argument(
         "--output-subdir",
         type=str,
         default=None,
@@ -113,91 +99,214 @@ def parse_args() -> argparse.Namespace:
             "deterministically from the effective run arguments."
         ),
     )
-    parser.add_argument("--max-length", type=int, default=1250, help="One-hot baseline pad/truncate length.")
-    parser.add_argument("--batch-size", type=int, default=8, help="Pairs per training batch.")
-    parser.add_argument("--num-workers", type=int, default=4, help="DataLoader worker processes.")
-    parser.add_argument("--max-epochs", type=int, default=10, help="Number of training epochs.")
-    parser.add_argument("--learning-rate", type=float, default=1e-3, help="Adam learning rate.")
-    parser.add_argument(
-        "--seed",
-        type=int,
-        default=42,
-        help="Random seed used by Python, NumPy, PyTorch, and DataLoader workers.",
+
+    # =========================================================================
+    # Shared data and loading
+    # =========================================================================
+    data = parser.add_argument_group('Shared data and loading')
+    data.add_argument(
+        "--interactions",
+        type=Path,
+        default=None,
+        help="Interaction TSV. Defaults to the strict TSV in /nfs/scratch/pdb_dimers.",
     )
-    parser.add_argument(
+    data.add_argument(
+        "--limit-rows",
+        type=int,
+        default=None,
+        help="Optional small-row limit for quick debugging. Leave unset for real training.",
+    )
+    data.add_argument("--batch-size", type=int, default=8, help="Pairs per training batch.")
+    data.add_argument("--num-workers", type=int, default=4, help="DataLoader worker processes.")
+
+    # =========================================================================
+    # Training and runtime
+    # =========================================================================
+    training = parser.add_argument_group('Training and runtime')
+    training.add_argument("--max-epochs", type=int, default=100, help="Number of training epochs.")
+    training.add_argument("--learning-rate", type=float, default=1e-3, help="Adam learning rate.")
+    training.add_argument("--accelerator", default="auto", help="Lightning accelerator, e.g. auto, cpu, gpu.")
+    training.add_argument("--devices", default="auto", help="Lightning devices, e.g. auto or 1.")
+    training.add_argument("--log-every-n-steps", type=int, default=50, help="How often Lightning logs progress.")
+
+    # =========================================================================
+    # Checkpoint selection and evaluation
+    # =========================================================================
+    evaluation = parser.add_argument_group('Checkpoint selection and evaluation')
+    evaluation.add_argument(
         "--selection-monitor",
         choices=("auto", *SELECTION_METRIC_MODES),
         default="auto",
         help=(
             "Validation metric used for checkpointing and early stopping. "
-            "'auto' uses val_loss for fully_connected and macro contact AUPRC "
+            "'auto' uses val_loss for fully_connected and interaction AUPRC "
             "for D-SCRIPT/query_patch."
         ),
     )
-    parser.add_argument(
+    evaluation.add_argument(
         "--selection-tiebreaker",
-        choices=("val_interaction_auprc", "val_contact_auprc_macro"),
-        default=None,
+        choices=tuple(SELECTION_METRIC_MODES),
+        default="val_contact_auprc_macro",
         help=(
             "Optional secondary validation metric to report from the checkpoint "
-            "selected by --selection-monitor. It does not alter checkpointing."
+            "selected by --selection-monitor. It does not alter checkpointing. "
+            "Use val_loss for a fully connected baseline selected by interaction AUPRC."
         ),
     )
-    parser.add_argument(
+    evaluation.add_argument(
+        "--early-stopping-patience",
+        type=int,
+        default=8,
+        help="Validation epochs without a sufficient primary-metric improvement before stopping.",
+    )
+    evaluation.add_argument(
+        "--early-stopping-min-delta",
+        type=float,
+        default=0.001,
+        help="Minimum primary-metric change counted by early stopping.",
+    )
+    evaluation.add_argument(
         "--skip-test",
         action="store_true",
         help="Skip test evaluation and test-output export during model selection.",
     )
-    parser.add_argument(
-        "--early-stopping-patience",
-        type=int,
-        default=5,
-        help="Validation epochs without a sufficient primary-metric improvement before stopping.",
+
+    # =========================================================================
+    # Fully connected baseline
+    # =========================================================================
+    baseline = parser.add_argument_group('Fully connected baseline')
+    baseline.add_argument(
+        "--sequence-file",
+        type=Path,
+        default=DEFAULT_SEQUENCE_FILE,
+        help="Entity sequence TSV for the fully_connected baseline.",
     )
-    parser.add_argument(
-        "--early-stopping-min-delta",
+    baseline.add_argument("--max-length", type=int, default=1250, help="One-hot baseline pad/truncate length.")
+    baseline.add_argument("--hidden-dim", type=int, default=512, help="Fully connected baseline hidden width.")
+    baseline.add_argument("--dropout", type=float, default=0.2, help="Fully connected baseline dropout.")
+
+    # =========================================================================
+    # D-SCRIPT and Query Patch: data and projection
+    # =========================================================================
+    shared = parser.add_argument_group('D-SCRIPT and Query Patch: data and projection')
+    shared.add_argument(
+        "--embedding-manifest",
+        type=Path,
+        default=DEFAULT_EMBEDDING_MANIFEST,
+        help="Embedding manifest with per_residue_path entries for D-SCRIPT and Query Patch.",
+    )
+    shared.add_argument(
+        "--contact-map-dir",
+        type=Path,
+        default=DEFAULT_CONTACT_MAP_DIR,
+        help="Directory containing <pdb_id>-assembly<assembly_number>.npy contact maps.",
+    )
+    shared.add_argument("--embedding-dim", type=int, default=1280, help="Per-residue embedding size for D-SCRIPT and Query Patch.")
+    shared.add_argument("--projection-dim", type=int, default=100, help="Projected residue size for D-SCRIPT and Query Patch.")
+    shared.add_argument("--projection-dropout", type=float, default=0.5, help="Projection dropout for D-SCRIPT and Query Patch.")
+
+    # =========================================================================
+    # D-SCRIPT and Query Patch: losses and contact metrics
+    # =========================================================================
+    losses = parser.add_argument_group('D-SCRIPT and Query Patch: losses and contact metrics')
+    losses.add_argument(
+        "--loss-mode",
+        choices=("auto", "basic", "dimer_type"),
+        default="auto",
+        help="'auto' uses dimer-type interaction weighting for keep_homomers and plain BCE otherwise.",
+    )
+    losses.add_argument(
+        "--interaction-loss-lambda",
         type=float,
-        default=0.01,
-        help="Minimum primary-metric change counted by early stopping.",
+        default=0.5,
+        help="Weight for interaction BCE. Contact BCE weight is 1 - this value.",
     )
-    parser.add_argument("--hidden-dim", type=int, default=512, help="Fully connected baseline hidden width.")
-    parser.add_argument("--dropout", type=float, default=0.2, help="Fully connected baseline dropout.")
-    parser.add_argument("--embedding-dim", type=int, default=1280, help="D-SCRIPT per-residue embedding size.")
-    parser.add_argument("--projection-dim", type=int, default=100, help="D-SCRIPT projected residue size.")
-    parser.add_argument("--contact-hidden-dim", type=int, default=50, help="D-SCRIPT contact module hidden channels.")
-    parser.add_argument("--contact-width", type=int, default=7, help="Odd convolution width for contact prediction.")
-    parser.add_argument("--projection-dropout", type=float, default=0.5, help="D-SCRIPT projection dropout.")
-    parser.add_argument(
+    losses.add_argument(
+        "--loss-type",
+        type=str,
+        choices=("contact", "sparsity_11", "sparsity_12", "sparsity_21", "sparsity_22", "balanced_bce", "balanced_bce_dice"),
+        default="balanced_bce",
+        help="Which loss type to apply for the contact map")
+    losses.add_argument(
+        "--omega",
+        default=0.5,
+        type=float,
+        help="Positive-class weight for final and compatibility contact-map balanced BCEs.",
+    )
+    losses.add_argument(
+        "--negative-contact-maps",
+        action="store_true",
+        help="Use zero contact targets for negative examples instead of unknown (-1).",
+    )
+    losses.add_argument(
+        "--contact-threshold",
+        type=float,
+        default=0.5,
+        help="Threshold at which predicted contact probabilities count as contacts for metrics.",
+    )
+
+    # =========================================================================
+    # D-SCRIPT and Query Patch: interaction head
+    # =========================================================================
+    interaction = parser.add_argument_group('D-SCRIPT and Query Patch: interaction head')
+    interaction.add_argument("--int-mod-type", default="normal", type=str, choices=("normal", "max"), help="Interaction readout: normal D-SCRIPT pooling or maximum contact logit.")
+    interaction.add_argument("--trainable-final-slope", action="store_true", default=True, help="DScript Interaction module slope applied.")
+    interaction.add_argument("--gamma-init", type=float, default=0.0, help="DScript gamma parameter of interaction module, (gamma*variance)-mean as threshold of high contacts.")
+    interaction.add_argument("--max-pooling", action="store_true", default=True, help="Using max pooling for normal interaction head.")
+
+    # =========================================================================
+    # D-SCRIPT contact head
+    # =========================================================================
+    dscript = parser.add_argument_group('D-SCRIPT contact head', description='Also used by Query Patch when --compatibility-head=dscript.')
+    dscript.add_argument("--contact-hidden-dim", type=int, default=50, help="D-SCRIPT contact module hidden channels.")
+    dscript.add_argument("--contact-width", type=int, default=7, help="Odd convolution width for contact prediction.")
+
+    # =========================================================================
+    # Query Patch: decoder and compatibility
+    # =========================================================================
+    query = parser.add_argument_group('Query Patch: decoder and compatibility')
+    query.add_argument(
         "--num-interaction-queries",
         type=int,
-        default=4,
+        default=64,
         help="Number of learned interface-patch queries for the query_patch model.",
     )
-    parser.add_argument(
+    query.add_argument(
         "--query-heads",
         type=int,
         default=4,
         help="Attention heads in each query_patch decoder layer.",
     )
-    parser.add_argument(
+    query.add_argument(
         "--query-layers",
         type=int,
         default=1,
         help="Transformer decoder layers in the query_patch contact module.",
     )
-    parser.add_argument(
+    query.add_argument(
         "--query-dropout",
         type=float,
         default=0.1,
         help="Dropout inside the query_patch transformer decoder.",
     )
-    parser.add_argument(
+    query.add_argument(
+        "--compatibility-head",
+        choices=("bilinear", "dscript"),
+        default="dscript",
+        help=(
+            "Compatibility head for query_patch: the existing signed bilinear "
+            "head or the local pairwise D-SCRIPT convolutional head."
+        ),
+    )
+    query.add_argument("--compatibility-rank", type=int, default=64, help="The dimension in which the compatibility for the query patch model is executed.")
+    query.add_argument("--compatibility-scale", type=float, default=10, help="The scale in which the compatibility is applied to the contact logits.")
+    query.add_argument(
         "--query-contact-bias-init",
         type=float,
         default=-6.0,
         help="Initial background contact logit of the compatibility branch.",
     )
-    parser.add_argument(
+    query.add_argument(
         "--query-evidence-mode",
         choices=("gated", "additive"),
         default="gated",
@@ -207,85 +316,26 @@ def parse_args() -> argparse.Namespace:
             "restores the original summed logits with only the main task losses."
         ),
     )
-    parser.add_argument(
+    query.add_argument(
         "--query-gate-bias-init",
         type=float,
         default=0.0,
         help="Initial logit bias of the query-patch compatibility gate (gated mode only).",
     )
-    parser.add_argument(
+    query.add_argument(
         "--query-interface-loss-weight",
         "--query-gate-loss-weight",
         dest="query_gate_loss_weight",
         type=float,
-        default=0.2,
+        default=0.5,
         help="Auxiliary balanced-BCE weight for chain-wise query interface masks (gated mode only).",
     )
-    parser.add_argument(
+    query.add_argument(
         "--interface-omega",
         type=float,
         default=0.2, # Around 20% of residues are interface residues
         help="Positive-class weight for the chain-wise query interface balanced BCE (gated mode only).",
     )
-    parser.add_argument(
-        "--interaction-loss-lambda",
-        type=float,
-        default=0.5,
-        help="Weight for interaction BCE. Contact BCE weight is 1 - this value.",
-    )
-    parser.add_argument(
-        "--contact-threshold",
-        type=float,
-        default=0.5,
-        help="Threshold at which predicted contact probabilities count as contacts for metrics.",
-    )
-    parser.add_argument(
-        "--loss-mode",
-        choices=("auto", "basic", "dimer_type"),
-        default="auto",
-        help="'auto' uses dimer-type interaction weighting for keep_homomers and plain BCE otherwise.",
-    )
-    parser.add_argument("--accelerator", default="auto", help="Lightning accelerator, e.g. auto, cpu, gpu.")
-    parser.add_argument("--devices", default="auto", help="Lightning devices, e.g. auto or 1.")
-    parser.add_argument("--log-every-n-steps", type=int, default=50, help="How often Lightning logs progress.")
-    parser.add_argument(
-        "--limit-rows",
-        type=int,
-        default=None,
-        help="Optional small-row limit for quick debugging. Leave unset for real training.",
-    )
-    parser.add_argument(
-        "--loss-type", 
-        required=True,
-        type=str, 
-        choices=("contact", "sparsity_11", "sparsity_12", "sparsity_21", "sparsity_22", "balanced_bce", "balanced_bce_dice"), 
-        help="Which loss type to apply for the contact map")
-    parser.add_argument(
-        "--omega",
-        default=0.5,
-        type=float,
-        help="Positive-class weight for final and compatibility contact-map balanced BCEs.",
-    )
-    parser.add_argument("--int-mod-type", default="normal", type=str, choices=("normal", "max"), help="Which loss type to apply for the contact map, choices: normal, max")
-    parser.add_argument("--trainable-final-slope", action="store_true", default=True, help="DScript Interaction module slope applied.")
-    parser.add_argument("--gamma-init", type=float, default=0.0, help="DScript gamma parameter of interaction module, (gamma*variance)-mean as threshold of high contacts.")
-    parser.add_argument(
-        "--negative-contact-maps",
-        action="store_true",
-        help="Use zero contact targets for negative examples instead of unknown (-1).",
-    )
-    parser.add_argument("--max-pooling", action="store_true", default=True, help="Using max pooling for normal interaction head.")
-    parser.add_argument(
-        "--compatibility-head",
-        choices=("bilinear", "dscript"),
-        default="bilinear",
-        help=(
-            "Compatibility head for query_patch: the existing signed bilinear "
-            "head or the local pairwise D-SCRIPT convolutional head."
-        ),
-    )
-    parser.add_argument("--compatibility-rank", type=int, default=64, help="The dimension in which the compatibility for the query patch model is executed.")
-    parser.add_argument("--compatibility-scale", type=float, default=10, help="The scale in which the compatibility is applied to the contact logits.")
     return parser.parse_args()
 
 
@@ -346,7 +396,7 @@ def resolve_selection_monitor(model_name: str, requested_monitor: str) -> str:
 
     Fully connected models do not produce contact maps, so macro contact AUPRC
     is invalid for them. D-SCRIPT and QUERY-PATCH expose all three configured
-    metrics and default to the contact-map metric used by recent experiments.
+    metrics and default to validation interaction AUPRC.
     """
     if requested_monitor == "auto":
         monitor = "val_loss" if model_name == "fully_connected" else MONITOR
