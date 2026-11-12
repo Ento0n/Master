@@ -14,7 +14,6 @@ from __future__ import annotations
 
 import argparse
 import csv
-import hashlib
 import json
 from pathlib import Path
 import sys
@@ -26,36 +25,18 @@ import numpy as np
 if not __package__:
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.training_pipeline import contact_threshold_metrics
+from scripts.figures import _contact_map_figure
+from scripts.figures._contact_map_figure import DEFAULT_REFERENCE, render_figure, sha256, verify_metrics
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_ANALYSIS = (REPO_ROOT / "jobs/training_pipeline/results/prostt5_additive_contact_figure"
                     / "7171489/qp_additive_normal_seed_42/contact_threshold_selection")
 DEFAULT_ARTIFACTS = DEFAULT_ANALYSIS.parent / "figure_1sez"
-DEFAULT_REFERENCE = DEFAULT_ARTIFACTS / "reference"
 
 
 # =============================================================================
 # Input integrity, identity matching, and independently checked map metrics
 # =============================================================================
-
-def sha256(path: Path) -> str:
-    """Hash large prediction caches without reading them all into memory."""
-    digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
-
-
-def verify_metrics(actual: dict, record: dict, prefix: str = "") -> None:
-    """Check exact confusion counts and full-precision scalar metric exports."""
-    for key, value in actual.items():
-        expected = float(record[prefix + key])
-        matches = value == expected if isinstance(value, int) else np.isclose(
-            value, expected, rtol=0, atol=1e-12)
-        if not matches:
-            raise ValueError(f"Metric mismatch for {prefix + key}: {value} != {expected}")
-
 
 def load_examples(analysis: Path, reference: Path) -> tuple[list, dict]:
     """Validate sources and return complete [-1,0,1] maps plus their metrics.
@@ -231,73 +212,6 @@ def load_examples(analysis: Path, reference: Path) -> tuple[list, dict]:
 # Full-extent red/white/gray panels and export metadata
 # =============================================================================
 
-def render_figure(examples: list, output: Path, artifacts: Path) -> int:
-    """Preserve full maps; export PNGs separately from the PDF and metadata."""
-    import matplotlib
-
-    matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
-    from matplotlib.colors import BoundaryNorm, ListedColormap
-    from matplotlib.patches import Patch
-
-    plt.rcParams.update({"font.family": "DejaVu Sans", "font.size": 9,
-                         "pdf.fonttype": 42, "ps.fonttype": 42})
-    gray, white, red = "#bdbdbd", "#ffffff", "#d00000"
-    cmap = ListedColormap([gray, white, red])
-    norm = BoundaryNorm([-1.5, -0.5, 0.5, 1.5], 3)
-    panel_width, column_gap = 2.0, 0.18
-    left_gutter, right_margin = 0.70, 0.08
-    header_height, metrics_height, row_gap, footer_height = 0.35, 0.24, 0.18, 0.55
-    row_heights = [panel_width * item["truth"].shape[0] / item["truth"].shape[1] for item in examples]
-    figure_width = left_gutter + 3 * panel_width + 2 * column_gap + right_margin
-    figure_height = header_height + sum(row_heights) + 3 * metrics_height + 2 * row_gap + footer_height
-    figure = plt.figure(figsize=(figure_width, figure_height), facecolor="white")
-    titles = ("Ground truth", "QUERY-PATCH Additive", "QUERY-PATCH Conv-IC")
-    for column, title in enumerate(titles):
-        center = left_gutter + column * (panel_width + column_gap) + panel_width / 2
-        figure.text(center / figure_width, 1 - 0.10 / figure_height, title,
-                    ha="center", va="top", fontsize=9, fontweight="bold")
-    top = figure_height - header_height
-    for example, height in zip(examples, row_heights):
-        truth, row = example["truth"], example["selection"]
-        bottom = top - height
-        figure.text(0.035 / figure_width, (top - 0.01) / figure_height,
-                    f"{row['selection_role']}\n{row['pdb_id']}", ha="left", va="top", fontsize=9)
-        matrices = (truth, example["predictions"]["qp_additive"], example["predictions"]["qp_conv_ic"])
-        for column, matrix in enumerate(matrices):
-            left = left_gutter + column * (panel_width + column_gap)
-            axis = figure.add_axes([left / figure_width, bottom / figure_height,
-                                    panel_width / figure_width, height / figure_height])
-            axis.imshow(matrix, cmap=cmap, norm=norm, interpolation="nearest", aspect="equal", rasterized=True)
-            axis.set_xticks([])
-            axis.set_yticks([])
-            for spine in axis.spines.values():
-                spine.set_color("#999999")
-                spine.set_linewidth(0.4)
-            if column == 0:
-                annotation = f"{truth.shape[0]} × {truth.shape[1]} residues"
-            else:
-                metrics = example["metrics"][("qp_additive", "qp_conv_ic")[column - 1]]
-                annotation = f"F1 {metrics['f1']:.3f}   ·   AUPRC {metrics['auprc']:.3f}"
-            figure.text((left + panel_width / 2) / figure_width, (bottom - 0.055) / figure_height,
-                        annotation, ha="center", va="top", fontsize=8)
-        top = bottom - metrics_height - row_gap
-    figure.text(0.5, 0.39 / figure_height, "Row labels refer to final QUERY-PATCH Conv-IC performance.",
-                ha="center", va="center", fontsize=8)
-    figure.legend(handles=[Patch(facecolor=red, label="Contact"),
-                           Patch(facecolor=white, edgecolor="#999999", label="No contact"),
-                           Patch(facecolor=gray, label="Unannotated")],
-                  loc="lower center", bbox_to_anchor=(0.5, 0.006), ncol=3, frameon=False, fontsize=8)
-    # One or more export pixels per residue cell prevents large maps from losing
-    # individual contacts in the scientific export; preview resolution is lower.
-    dpi = max(500, int(np.ceil(max(item["truth"].shape[1] for item in examples) / panel_width)))
-    figure.savefig(artifacts / "contact_additive_comparison.pdf", dpi=dpi)
-    figure.savefig(output / "contact_additive_comparison.png", dpi=dpi)
-    figure.savefig(output / "contact_additive_comparison_preview.png", dpi=160)
-    plt.close(figure)
-    return dpi
-
-
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--additive-analysis", default=DEFAULT_ANALYSIS, type=Path,
@@ -316,7 +230,9 @@ def main() -> None:
     examples, provenance = load_examples(analysis, reference)
     output.mkdir(parents=True, exist_ok=True)
     artifacts.mkdir(parents=True, exist_ok=True)
-    provenance["dpi"] = render_figure(examples, output, artifacts)
+    provenance["dpi"] = render_figure(
+        examples, output, artifacts, stem="contact_additive_comparison",
+        columns=(("qp_additive", "QUERY-PATCH Additive"), ("qp_conv_ic", "QUERY-PATCH Conv-IC")))
     records = []
     for example in examples:
         for model in ("qp_additive", "qp_conv_ic"):
@@ -333,10 +249,11 @@ def main() -> None:
     # Record the helper actually imported, now located in training_pipeline.
     helper = Path(contact_threshold_metrics.__file__).resolve()
     provenance["input_sha256"][str(helper)] = sha256(helper)
+    renderer = Path(_contact_map_figure.__file__).resolve()
+    provenance["input_sha256"][str(renderer)] = sha256(renderer)
     # Explicit paths keep the two output locations verifiable without including
     # an old provenance file or other figures in this export's own hashes.
     output_paths = (output / "contact_additive_comparison.png",
-                    output / "contact_additive_comparison_preview.png",
                     artifacts / "contact_additive_comparison.pdf",
                     artifacts / "selected_examples.csv")
     provenance["output_paths"] = {path.name: str(path) for path in output_paths}
