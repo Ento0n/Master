@@ -1,4 +1,4 @@
-"""Reusable contact-map losses shared by the training pipeline and tests."""
+"""Reusable contact-map losses used by the training pipeline."""
 
 from __future__ import annotations
 
