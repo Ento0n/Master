@@ -2,6 +2,11 @@
 
 Last reviewed: 2026-09-09
 
+Artifact paths updated: 2026-09-15. Results and logs now use matching sweep
+folders. Original path strings inside historical logs and submission records
+remain unchanged; the [migration map](../jobs/training_pipeline/artifact_index/moves.json)
+maps those recorded paths to their current locations.
+
 This document records how the query-patch model evolved and maps each experimental
 stage to the `max_epochs` value used to identify its artifacts under
 [`jobs/training_pipeline/results`](../jobs/training_pipeline/results). It covers
@@ -56,6 +61,32 @@ Additive combination also supports `--compatibility-head dscript` as an addition
 ablation, but that combination is not the thesis's historical QP-Additive model.
 The convolutional head does not use `--compatibility-rank` or
 `--compatibility-scale`.
+
+## ProstT5 SLURM Comparison
+
+[`prostt5_model_comparison.sh`](../jobs/training_pipeline/prostt5_model_comparison.sh)
+trains and evaluates the four thesis variants with both interaction heads: eight
+array tasks, with at most four running simultaneously. It loads the cached
+`prostt5/manifest.tsv` and explicitly sets the embedding dimension to **1024**.
+
+Submit from the repository root with your training Python environment activated:
+
+```bash
+sbatch jobs/training_pipeline/prostt5_model_comparison.sh
+# Also include additive convolutional compatibility (ten combinations total):
+sbatch --array=0-9%4 jobs/training_pipeline/prostt5_model_comparison.sh
+```
+
+Tasks `0/1`, `2/3`, `4/5`, and `6/7` correspond to D-SCRIPT, QP-Additive,
+QP-Bilin-IC, and QP-Conv-IC; optional tasks `8/9` add QP-Additive-Conv. Even task
+IDs use `normal`, odd IDs use `max`. The script uses the pipeline defaults for
+`omega=0.5`, interaction weight `0.5`, and four queries. It explicitly sets a
+100-epoch cap (the pipeline default is 10) and passes balanced BCE because
+`--loss-type` is a required CLI argument. The pipeline early-stops and tests the
+best validation checkpoint. Edit the job file directly to change run settings.
+
+Results are isolated under `jobs/training_pipeline/results/prostt5/<array-job-id>`
+and W&B runs are grouped as `prostt5-<array-job-id>`.
 
 ## Current Model at a Glance
 
@@ -219,25 +250,25 @@ The configured epoch cap is intentionally used as an experiment-generation marke
 It is not the number of epochs that every run completed: early stopping usually
 ended training earlier.
 
-| `max_epochs` | Run date | W&B sweep | SLURM job | Method and change tested | Result-directory pattern | Artifacts observed |
+| `max_epochs` | Run date | W&B sweep | SLURM job | Method and change tested | Result-directory pattern (relative to `results/`) | Artifacts observed |
 |---:|---|---|---:|---|---|---:|
-| 97 | 2026-08-03/04 | `3i1q6nkt` | `6432851` | Bayesian initial query-decoder search without compatibility. Varied interaction head, query count, heads, layers, dropout, and contact bias. | `querypatch-*_97` | 28 runs, 20 unique directories |
-| 96 | 2026-08-04/05 | `9833yis3` | `6433993` | Bayesian additive-compatibility search. Added compatibility rank and trainable scale initialization. | `querypatch-*_96` | 60 directories |
-| 95 | 2026-08-06 onward | `uhjcq9sp` | `6453061` | Broad Bayesian fixed-compatibility search over five loss types, query architecture, dropout, bias, rank, scale, and interaction head. | `95_model=query_patch_*` | 230 directories; 226 completed, 4 partial |
-| 94 | 2026-08-12 | `v6bjofvo` | `6504538` | Fixed grid: query patch vs. D-SCRIPT, balanced BCE vs. balanced BCE + Dice, max vs. normal interaction head, `omega=0.5`. | `94_model=query_patch_*` | 4 query-patch / 8 total |
-| 93 | 2026-08-13/14 | `k7vtr11y` | `6507382` | Bayesian continuation of max 94, now varying `omega` uniformly from `0.2` to `0.8`. | `93_model=query_patch_*` | 12 query-patch / 28 total |
-| 92 | 2026-08-17 | `7pu2koy9` | `6529755` | Grid over direct pairwise gate-loss weight `[0, 0.05, 0.2, 0.5]` and gate bias `[-2, 0]`. | `92_model=query_patch_*qgatew=*` | 8 directories |
-| 91 | 2026-08-20 | `11zro799` | `6548787` | `5 x 5` grid over interface-loss weight `[0, 0.05, 0.2, 0.5, 1]` and contact `omega` `[0.02, 0.05, 0.1, 0.2, 0.5]`, with `interface_omega=0.2`. | `91_model=query_patch_*qifw=*ifomega=0.2*` | 25 directories |
+| 97 | 2026-08-03/04 | `3i1q6nkt` | `6432851` | Bayesian initial query-decoder search without compatibility. Varied interaction head, query count, heads, layers, dropout, and contact bias. | `query_patch_architecture_sweep_3i1q6nkt/querypatch-*_97` | 28 runs, 20 unique directories |
+| 96 | 2026-08-04/05 | `9833yis3` | `6433993` | Bayesian additive-compatibility search. Added compatibility rank and trainable scale initialization. | `query_patch_compatibility_scale_sweep_9833yis3/querypatch-*_96` | 60 directories |
+| 95 | 2026-08-06 onward | `uhjcq9sp` | `6453061` | Broad Bayesian fixed-compatibility search over five loss types, query architecture, dropout, bias, rank, scale, and interaction head. | `query_patch_additive_sweep_uhjcq9sp/95_model=query_patch_*` | 230 directories; 226 completed, 4 partial |
+| 94 | 2026-08-12 | `v6bjofvo` | `6504538` | Fixed grid: query patch vs. D-SCRIPT, balanced BCE vs. balanced BCE + Dice, max vs. normal interaction head, `omega=0.5`. | `balanced_loss_head_sweep_v6bjofvo/94_model=query_patch_*` | 4 query-patch / 8 total |
+| 93 | 2026-08-13/14 | `k7vtr11y` | `6507382` | Bayesian continuation of max 94, now varying `omega` uniformly from `0.2` to `0.8`. | `balanced_loss_omega_sweep_k7vtr11y/93_model=query_patch_*` | 12 query-patch / 28 total |
+| 92 | 2026-08-17 | `7pu2koy9` | `6529755` | Grid over direct pairwise gate-loss weight `[0, 0.05, 0.2, 0.5]` and gate bias `[-2, 0]`. | `query_patch_gate_sweep_7pu2koy9/92_model=query_patch_*qgatew=*` | 8 directories |
+| 91 | 2026-08-20 | `11zro799` | `6548787` | `5 x 5` grid over interface-loss weight `[0, 0.05, 0.2, 0.5, 1]` and contact `omega` `[0.02, 0.05, 0.1, 0.2, 0.5]`, with `interface_omega=0.2`. | `query_patch_interface_sweep_11zro799/91_model=query_patch_*qifw=*ifomega=0.2*` | 25 directories |
 
 Representative logs containing the authoritative W&B configurations are:
 
-- [max 97](../jobs/training_pipeline/logs/query-patch-sweep-6432851_0.err)
-- [max 96](../jobs/training_pipeline/logs/query-patch-sweep-6433993_0.err)
-- [max 95](../jobs/training_pipeline/logs/query-patch-sweep-6453061_0.err)
-- [max 94](../jobs/training_pipeline/logs/balanced-bce-sweep-6504538_0.err)
-- [max 93](../jobs/training_pipeline/logs/balanced-bce-sweep-6507382_0.err)
-- [max 92](../jobs/training_pipeline/logs/aux-loss-sweep-6529755_0.err)
-- [max 91](../jobs/training_pipeline/logs/aux-loss-sweep-6548787_0.err)
+- [max 97](../jobs/training_pipeline/logs/query_patch_architecture_sweep_3i1q6nkt/query-patch-sweep-6432851_0.err)
+- [max 96](../jobs/training_pipeline/logs/query_patch_compatibility_scale_sweep_9833yis3/query-patch-sweep-6433993_0.err)
+- [max 95](../jobs/training_pipeline/logs/query_patch_additive_sweep_uhjcq9sp/query-patch-sweep-6453061_0.err)
+- [max 94](../jobs/training_pipeline/logs/balanced_loss_head_sweep_v6bjofvo/balanced-bce-sweep-6504538_0.err)
+- [max 93](../jobs/training_pipeline/logs/balanced_loss_omega_sweep_k7vtr11y/balanced-bce-sweep-6507382_0.err)
+- [max 92](../jobs/training_pipeline/logs/query_patch_gate_sweep_7pu2koy9/aux-loss-sweep-6529755_0.err)
+- [max 91](../jobs/training_pipeline/logs/query_patch_interface_sweep_11zro799/aux-loss-sweep-6548787_0.err)
 
 The currently tracked sweep definitions are:
 
@@ -250,21 +281,22 @@ The currently tracked sweep definitions are:
 
 ## How to Locate a Generation Under `results`
 
-The two oldest query-patch generations used the epoch marker as a suffix:
+The patterns below are current locations; the sweep folders contain the original
+run-directory names. The two oldest generations used the epoch marker as a suffix:
 
 ```bash
-jobs/training_pipeline/results/querypatch-*_97
-jobs/training_pipeline/results/querypatch-*_96
+jobs/training_pipeline/results/query_patch_architecture_sweep_3i1q6nkt/querypatch-*_97
+jobs/training_pipeline/results/query_patch_compatibility_scale_sweep_9833yis3/querypatch-*_96
 ```
 
 From max 95 onward, the output naming convention puts `max_epochs` first:
 
 ```bash
-jobs/training_pipeline/results/95_model=query_patch_*
-jobs/training_pipeline/results/94_model=query_patch_*
-jobs/training_pipeline/results/93_model=query_patch_*
-jobs/training_pipeline/results/92_model=query_patch_*
-jobs/training_pipeline/results/91_model=query_patch_*
+jobs/training_pipeline/results/query_patch_additive_sweep_uhjcq9sp/95_model=query_patch_*
+jobs/training_pipeline/results/balanced_loss_head_sweep_v6bjofvo/94_model=query_patch_*
+jobs/training_pipeline/results/balanced_loss_omega_sweep_k7vtr11y/93_model=query_patch_*
+jobs/training_pipeline/results/query_patch_gate_sweep_7pu2koy9/92_model=query_patch_*
+jobs/training_pipeline/results/query_patch_interface_sweep_11zro799/91_model=query_patch_*
 ```
 
 The naming implementation explicitly keeps `max_epochs` first for grouping; see
